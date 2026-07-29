@@ -66,6 +66,27 @@ STYLE = """
   .stTabs [data-baseweb="tab-list"] { gap: 4px; }
   .stTabs [data-baseweb="tab"] { padding: 8px 18px; }
 
+  /* The source footage is 640x480. Left alone it stretches to ~1240px — a
+     2x upscale that looks soft and is tall enough to push the title and tabs
+     off screen at 100% zoom. Cap it at a mild upscale and bound it by
+     viewport height so the page fits on a 1080p laptop.
+     The <video> element itself carries data-testid="stVideo" (it is not a
+     child of it) and an inline width:100%, so the selector must target the
+     element directly and !important is required to beat the inline style. */
+  video[data-testid="stVideo"], video.stVideo {
+    /* Height drives the size and width follows the 4:3 ratio, so the player
+       always clears the fold instead of overflowing it. 58vh leaves room for
+       the title, tabs and controls above; the 620px cap stops it ballooning
+       on tall monitors. Setting width instead (and letting height follow)
+       overflowed a 1080p screen by ~90px, and width:auto alone collapses to
+       the native 640px, which is too small. */
+    height: min(58vh, 620px) !important;
+    width: auto !important;
+    max-width: 100% !important;
+    display: block;
+    border-radius: 8px;
+  }
+
   .casa-caption { color: #9a9a94; font-size: 0.85rem; line-height: 1.5; }
   .casa-ref {
     background: #1e1e1c; border: 1px solid #2e2e2c; border-left: 3px solid #6b6b68;
