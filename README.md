@@ -153,7 +153,23 @@ for this). VCL/VSL/VAP/LIN/STR/WOB are unaffected, but ALH is likely
 underestimated and BCF should be treated as indicative only. This is a
 camera frame-rate limit, not something fixable in software.
 
-## Deploying to AWS
+## Continuous deployment
+
+Every push to `main` redeploys automatically via
+[.github/workflows/deploy.yml](.github/workflows/deploy.yml): rsync the code,
+reinstall requirements, restart the service, then poll `/_stcore/health` for
+up to two minutes. If the app does not come back the run fails red and prints
+the last 40 lines of `journalctl` — a green tick on a dead service would be
+worse than no CI at all.
+
+Repository secrets required: `EC2_HOST`, `EC2_USER`, `EC2_SSH_KEY`.
+
+`videos/` is excluded from the sync, and rsync protects excluded paths from
+`--delete`, so a deploy can never remove analysed results from the server.
+To redeploy the current `main` without a commit, use "Run workflow" on the
+Actions tab.
+
+## First-time AWS setup
 
 For a shared demo link. CPU instance is fine — inference is single-threaded,
 so a bigger box changes little; the point is a stable URL, not speed.
