@@ -1,0 +1,17 @@
+# Pinned, not >=. ultralytics 8.4 removed BYTETracker's frame_rate kwarg, and
+# the tracker tuning in tracking/tracker.py (match_thresh=0.95, the
+# fragmentation fix) was measured against 8.3.x association behaviour — a
+# silent minor-version bump would break tracking or change results without
+# any test noticing.
+ultralytics==8.3.124
+opencv-python>=4.10,<5      # cv2 5.x is a major bump; not validated here
+numpy>=1.26,<3
+scipy>=1.13
+pandas>=2.2
+streamlit>=1.30
+matplotlib>=3.8
+
+# ByteTrack ships inside ultralytics (trackers/bytetrack.yaml) — no separate package.
+# ffmpeg (system package, not pip) is needed to transcode output video for
+# browser playback; the dashboard degrades to download-only without it.
+# FastAPI / React frontend deferred — the Streamlit dashboard covers the demo.

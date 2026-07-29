@@ -1,0 +1,12 @@
+[server]
+# Hard server-side cap. The reference clips are 2-4 MB, so 50 MB covers
+# similar footage with room to spare while bounding disk use on a small
+# EC2 volume.
+maxUploadSize = 50
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"

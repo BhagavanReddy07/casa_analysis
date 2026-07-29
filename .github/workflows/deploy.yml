@@ -1,0 +1,65 @@
+name: Deploy to EC2
+
+# Every push to main redeploys. workflow_dispatch lets you redeploy the
+# current main by hand from the Actions tab without an empty commit.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never let two deploys overwrite each other mid-rsync.
+concurrency:
+  group: deploy-ec2
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy.pem
+          chmod 600 ~/.ssh/deploy.pem
+          # Pin the host key instead of disabling checking, so a hijacked
+          # DNS/IP cannot silently receive the deploy.
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Sync code
+        run: |
+          rsync -az --delete \
+            --exclude '.git' --exclude '.github' \
+            --exclude 'videos' --exclude '.venv' \
+            --exclude '__pycache__' --exclude 'sperm_pose_baseline' \
+            -e "ssh -i ~/.ssh/deploy.pem -o StrictHostKeyChecking=yes" \
+            ./ "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:~/sperm_CASA/"
+          # --delete removes files deleted from the repo, but rsync protects
+          # excluded paths from deletion, so videos/ on the server is safe.
+
+      - name: Install dependencies and restart
+        run: |
+          ssh -i ~/.ssh/deploy.pem "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" '
+            set -e
+            cd ~/sperm_CASA
+            .venv/bin/pip install -q -r requirements.txt
+            sudo systemctl restart casa
+          '
+
+      - name: Verify the deploy is actually serving
+        run: |
+          # Fail the run if the app does not come back — a green tick on a
+          # dead service is worse than a red one.
+          for i in $(seq 1 12); do
+            if curl -fsS --max-time 10 \
+               "http://${{ secrets.EC2_HOST }}:8501/_stcore/health" >/dev/null; then
+              echo "healthy after $((i * 10))s"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "service did not become healthy within 120s"
+          ssh -i ~/.ssh/deploy.pem "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
+            'sudo journalctl -u casa -n 40 --no-pager'
+          exit 1

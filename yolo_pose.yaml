@@ -1,0 +1,8 @@
+path: data/yolo_pose
+train: train/images
+val: val/images
+test: test/images
+names:
+  0: sperm
+kpt_shape: [2, 3]
+flip_idx: [0, 1]
