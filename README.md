@@ -164,6 +164,10 @@ worse than no CI at all.
 
 Repository secrets required: `EC2_HOST`, `EC2_USER`, `EC2_SSH_KEY`.
 
+The instance uses an Elastic IP (`13.204.5.64`), so the address survives a
+stop/start. If it is ever re-allocated, `EC2_HOST` must be updated to match
+or every deploy will fail trying to reach the old address.
+
 `videos/` is excluded from the sync, and rsync protects excluded paths from
 `--delete`, so a deploy can never remove analysed results from the server.
 To redeploy the current `main` without a commit, use "Run workflow" on the
