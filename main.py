@@ -90,10 +90,16 @@ def pipeline_fingerprint() -> str:
 
 
 def stale_videos(input_dir: Path, output_dir: Path) -> list[Path]:
-    """Inputs never analysed, or analysed by a different version of the code."""
+    """Inputs never analysed, or analysed by a different version of the code.
+
+    Covers the preloaded samples and dashboard uploads alike — they are the
+    same files to this, and the suffixes are the ones the uploader accepts.
+    """
     current = pipeline_fingerprint()
     stale = []
-    for source in sorted(input_dir.glob("*.mp4")):
+    sources = (p for p in sorted(input_dir.iterdir())
+               if p.suffix.lower() in {".mp4", ".avi", ".mov"})
+    for source in sources:
         stamp = output_dir / f"{source.stem}.build"
         csv = output_dir / f"{source.stem}_metrics.csv"
         if not csv.exists() or not stamp.exists() or stamp.read_text().strip() != current:
