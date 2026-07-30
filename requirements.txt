@@ -10,6 +10,7 @@ scipy>=1.13
 pandas>=2.2
 streamlit>=1.30
 matplotlib>=3.8
+motmetrics>=1.4        # evaluation/track_eval.py only: IDF1, ID switches, MOTA
 
 # ByteTrack ships inside ultralytics (trackers/bytetrack.yaml) — no separate package.
 # ffmpeg (system package, not pip) is needed to transcode output video for

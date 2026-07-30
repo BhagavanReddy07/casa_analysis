@@ -17,6 +17,7 @@ __pycache__/
 .venv/
 venv/
 .env
+sperm1/
 
 # Streamlit local secrets (config.toml itself is committed)
 .streamlit/secrets.toml
