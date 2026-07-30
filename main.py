@@ -3,6 +3,7 @@
     python main.py --source videos/input/22.mp4                    # detection only
     python main.py --source videos/input/22.mp4 --track            # + persistent IDs
     python main.py --source videos/input/22.mp4 --track --metrics  # + VCL/VSL/... CSV
+    python main.py --rebuild                                       # redo whatever the code outdated
 """
 
 from __future__ import annotations
@@ -58,7 +59,31 @@ def parse_args() -> argparse.Namespace:
     metrics_group.add_argument("--immotile-vcl", type=float, default=10.0, help="um/s")
     metrics_group.add_argument("--progressive-vsl", type=float, default=25.0, help="um/s")
     metrics_group.add_argument("--progressive-str", type=float, default=0.8, help="VSL/VAP ratio")
+
+    parser.add_argument("--rebuild", action="store_true",
+                        help="re-analyse every video in videos/input whose results are older than "
+                             "the detection/tracking/CASA code, and ignore --source")
+    parser.add_argument("--input-dir", type=Path, default=Path("videos/input"),
+                        help="where --rebuild looks for source videos")
     return parser.parse_args()
+
+
+# Directories whose .py files change what a result looks like. The dashboard
+# only reads finished files, so nothing else notices that a fix has landed and
+# every clip in videos/output stays as it was until this is run.
+PIPELINE_DIRS = ("detection", "tracking", "casa", "utils")
+
+
+def stale_videos(input_dir: Path, output_dir: Path) -> list[Path]:
+    """Inputs with no metrics CSV, or one written before the last code change."""
+    code_mtime = max(p.stat().st_mtime
+                     for d in PIPELINE_DIRS for p in Path(d).glob("*.py"))
+    stale = []
+    for source in sorted(input_dir.glob("*.mp4")):
+        csv = output_dir / f"{source.stem}_metrics.csv"
+        if not csv.exists() or csv.stat().st_mtime < code_mtime:
+            stale.append(source)
+    return stale
 
 
 def main() -> None:
@@ -75,7 +100,7 @@ def main() -> None:
     # detections, so tracking feeds the detector's marginal output through and
     # lets the tracker thresholds decide. Detection-only mode keeps 0.25.
     conf = args.conf if args.conf is not None else (
-        tracker_config.track_low_thresh if args.track else 0.25
+        tracker_config.track_low_thresh if args.track or args.rebuild else 0.25
     )
 
     config = Config(
@@ -96,11 +121,23 @@ def main() -> None:
     )
 
     detector = SpermDetector(config)
-    destination = run(detector, args.source, config, show=args.show,
-                      max_frames=args.max_frames, track=args.track,
-                      tracker_config=tracker_config, metrics=args.metrics,
-                      microns_per_pixel=args.um_per_px, motility_thresholds=thresholds)
-    logger.info("output written to %s", destination)
+
+    if args.rebuild:
+        sources = stale_videos(args.input_dir, args.output)
+        if not sources:
+            logger.info("every video in %s is already up to date", args.input_dir)
+            return
+        logger.info("re-analysing %d video(s): %s",
+                    len(sources), ", ".join(s.stem for s in sources))
+    else:
+        sources = [args.source]
+
+    for source in sources:
+        destination = run(detector, str(source), config, show=args.show,
+                          max_frames=args.max_frames, track=args.track or args.rebuild,
+                          tracker_config=tracker_config, metrics=args.metrics or args.rebuild,
+                          microns_per_pixel=args.um_per_px, motility_thresholds=thresholds)
+        logger.info("output written to %s", destination)
 
 
 if __name__ == "__main__":
