@@ -241,3 +241,7 @@ YOLO detection → ByteTrack → trajectories → CASA metrics → motility clas
 ```
 
 Each stage is a separate package so it can be tested and swapped on its own.
+
+Identity stability at crossings is the open problem — see
+[docs/tracking-plan.md](docs/tracking-plan.md) for the six steps that address
+it, what each one needs by hand, and the measurements behind the ordering.
