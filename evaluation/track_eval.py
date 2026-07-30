@@ -10,6 +10,7 @@ question for this data and needs no re-annotation.
 Two modes::
 
     python -m evaluation.track_eval prefill    # writes a reviewable gt.txt
+    python -m evaluation.track_eval review     # video of just the doubtful moments
     python -m evaluation.track_eval score      # IDF1 / ID switches / MOTA
 
 ``prefill`` runs the tracker and copies its identity onto each annotated box,
@@ -41,6 +42,9 @@ LABELS_DIR = Path("sperm1/sperm1/obj_train_data")
 GT_PATH = Path("data/raw/gt.txt")
 FLAGS_PATH = Path("data/raw/gt_flags.csv")
 CROPS_PATH = Path("data/raw/unlabelled_crops.png")
+REVIEW_PATH = Path("data/raw/review.mp4")
+ADDED_BOX = (58.0, 53.0)          # median hand-drawn box, for machine-added cells
+REVIEW_CONTEXT = 5                # frames either side of a flagged moment
 
 
 def load_boxes(width: int, height: int) -> dict[int, list[tuple[float, float, float, float]]]:
@@ -121,9 +125,20 @@ def prefill(source: Path, config: Config, tracker_config: TrackerConfig) -> None
             lines.append(f"{index + 1},{track.track_id},{x:.1f},{y:.1f},"
                          f"{box[2] - x:.1f},{box[3] - y:.1f},1,1,1")
 
+        # Cells the model found but the annotator never boxed. Inspection of
+        # data/raw/unlabelled_crops.png says these are real sperm, not debris,
+        # and leaving them out would mark every tracker down for finding real
+        # cells. They go in with conf 0.5 so a reviewer can tell them from the
+        # hand-drawn ones, sized like the median human box so the head-inside
+        # test behaves identically.
         for track in tracks:
-            if track.track_id not in claimed:
-                unmatched_heads.append((index, track.detection.head))
+            if track.track_id in claimed:
+                continue
+            hx, hy = track.detection.head
+            unmatched_heads.append((index, (hx, hy)))
+            lines.append(f"{index + 1},{track.track_id},{hx - ADDED_BOX[0] / 2:.1f},"
+                         f"{hy - ADDED_BOX[1] / 2:.1f},{ADDED_BOX[0]:.1f},{ADDED_BOX[1]:.1f},"
+                         f"0.5,1,1")
 
     GT_PATH.parent.mkdir(parents=True, exist_ok=True)
     GT_PATH.write_text("\n".join(lines) + "\n")
@@ -153,6 +168,61 @@ def _crop_sheet(frames: list[Path], heads: list[tuple[int, tuple[float, float]]]
         r, c = divmod(n, columns)
         sheet[r * size:(r + 1) * size, c * size:(c + 1) * size] = image[y:y + size, x:x + size]
     cv2.imwrite(str(CROPS_PATH), sheet)
+
+
+def review() -> None:
+    """Render only the doubtful moments, so the 207 fixes can be eyeballed first.
+
+    Green box with a number = an identity the machine is confident about. Red =
+    the box it was unsure of, with the reason printed. A few frames either side
+    are included so the crossing can be watched, not just glimpsed.
+    """
+    frames = sorted(FRAMES_DIR.glob("*.png"))
+    height, width = cv2.imread(str(frames[0])).shape[:2]
+    boxes = load_boxes(width, height)
+
+    identities: dict[int, list[tuple[int, tuple[float, float, float, float]]]] = {}
+    for line in GT_PATH.read_text().splitlines():
+        frame, tid, x, y, w, h, conf, *_ = line.split(",")
+        identities.setdefault(int(frame) - 1, []).append(
+            (int(tid), (float(x), float(y), float(x) + float(w), float(y) + float(h))))
+
+    trouble: dict[int, list[str]] = {}
+    for line in FLAGS_PATH.read_text().splitlines()[1:]:
+        frame, box_index, reason = line.split(",", 2)
+        trouble.setdefault(int(frame), []).append(f"box {box_index}: {reason}")
+
+    wanted = sorted({f for frame in trouble
+                     for f in range(max(0, frame - REVIEW_CONTEXT),
+                                    min(len(frames), frame + REVIEW_CONTEXT + 1))})
+    REVIEW_PATH.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(str(REVIEW_PATH), cv2.VideoWriter_fourcc(*"mp4v"),
+                             5.0, (width, height))
+    try:
+        for index in wanted:
+            image = cv2.imread(str(frames[index]))
+            for tid, box in identities.get(index, []):
+                p1, p2 = (int(box[0]), int(box[1])), (int(box[2]), int(box[3]))
+                cv2.rectangle(image, p1, p2, (0, 220, 0), 1)
+                cv2.putText(image, str(tid), (p1[0], p1[1] - 3),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 220, 0), 1)
+            for note in trouble.get(index, []):
+                box_index = int(note.split()[1].rstrip(":"))
+                if box_index < len(boxes.get(index, [])):
+                    box = boxes[index][box_index]
+                    cv2.rectangle(image, (int(box[0]), int(box[1])),
+                                  (int(box[2]), int(box[3])), (0, 0, 255), 2)
+            cv2.putText(image, f"frame {index}", (5, 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+            for row, note in enumerate(trouble.get(index, [])[:3]):
+                cv2.putText(image, note[:70], (5, height - 8 - 14 * row),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+            writer.write(image)
+    finally:
+        writer.release()
+
+    logger.info("%d frames covering %d doubtful moments -> %s",
+                len(wanted), sum(len(v) for v in trouble.values()), REVIEW_PATH)
 
 
 def score(config: Config, tracker_config: TrackerConfig) -> None:
@@ -200,7 +270,7 @@ def score(config: Config, tracker_config: TrackerConfig) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("mode", choices=["prefill", "score"])
+    parser.add_argument("mode", choices=["prefill", "review", "score"])
     parser.add_argument("--source", type=Path, default=Path("videos/input/22.mp4"))
     parser.add_argument("--weights", type=Path, default=Path("models/best.pt"))
     args = parser.parse_args()
@@ -211,6 +281,8 @@ def main() -> None:
 
     if args.mode == "prefill":
         prefill(args.source, config, tracker_config)
+    elif args.mode == "review":
+        review()
     else:
         score(config, tracker_config)
 
