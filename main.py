@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 from pathlib import Path
 
@@ -74,14 +75,28 @@ def parse_args() -> argparse.Namespace:
 PIPELINE_DIRS = ("detection", "tracking", "casa", "utils")
 
 
+def pipeline_fingerprint() -> str:
+    """Hash of the code that decides what a result looks like.
+
+    Content, not mtime: a deploy checks the repo out fresh, so every file's
+    mtime is "now" on the server and a timestamp comparison would re-analyse
+    every clip on every push, including README-only ones.
+    """
+    digest = hashlib.sha256()
+    for directory in PIPELINE_DIRS:
+        for path in sorted(Path(directory).glob("*.py")):
+            digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
+
+
 def stale_videos(input_dir: Path, output_dir: Path) -> list[Path]:
-    """Inputs with no metrics CSV, or one written before the last code change."""
-    code_mtime = max(p.stat().st_mtime
-                     for d in PIPELINE_DIRS for p in Path(d).glob("*.py"))
+    """Inputs never analysed, or analysed by a different version of the code."""
+    current = pipeline_fingerprint()
     stale = []
     for source in sorted(input_dir.glob("*.mp4")):
+        stamp = output_dir / f"{source.stem}.build"
         csv = output_dir / f"{source.stem}_metrics.csv"
-        if not csv.exists() or csv.stat().st_mtime < code_mtime:
+        if not csv.exists() or not stamp.exists() or stamp.read_text().strip() != current:
             stale.append(source)
     return stale
 
@@ -137,6 +152,10 @@ def main() -> None:
                           max_frames=args.max_frames, track=args.track or args.rebuild,
                           tracker_config=tracker_config, metrics=args.metrics or args.rebuild,
                           microns_per_pixel=args.um_per_px, motility_thresholds=thresholds)
+        if args.rebuild:
+            # Written last, so an interrupted rebuild leaves the clip stale and
+            # the next deploy picks it up again.
+            (args.output / f"{Path(source).stem}.build").write_text(pipeline_fingerprint())
         logger.info("output written to %s", destination)
 
 

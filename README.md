@@ -169,7 +169,21 @@ stop/start. If it is ever re-allocated, `EC2_HOST` must be updated to match
 or every deploy will fail trying to reach the old address.
 
 `videos/` is excluded from the sync, and rsync protects excluded paths from
-`--delete`, so a deploy can never remove analysed results from the server.
+`--delete`, so a deploy can never remove analysed results from the server —
+and no local clip is ever uploaded by a deploy. Only what already sits in
+`videos/input` on the instance, i.e. what was uploaded through the dashboard,
+is analysed there.
+
+Once the app is healthy the deploy dispatches `main.py --rebuild` on the
+instance and returns without waiting. That re-analyses every clip whose
+results came from different pipeline code — otherwise a tracking fix would
+land while the dashboard kept serving the results it invalidated. Staleness
+is decided by a hash of `detection/ tracking/ casa/ utils/*.py` stored in
+`videos/output/<name>.build`, so a docs-only push rebuilds nothing. Each clip
+takes 15-20 minutes on two vCPUs and appears in the dashboard as it finishes;
+watch `~/sperm_CASA/videos/rebuild.log`. A deploy landing mid-rebuild skips
+(`flock -n`) rather than starting a second one.
+
 To redeploy the current `main` without a commit, use "Run workflow" on the
 Actions tab.
 

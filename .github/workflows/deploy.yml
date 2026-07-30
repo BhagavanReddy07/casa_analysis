@@ -63,3 +63,21 @@ jobs:
           ssh -i ~/.ssh/deploy.pem "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
             'sudo journalctl -u casa -n 40 --no-pager'
           exit 1
+
+      - name: Re-analyse the videos this push outdated
+        run: |
+          # Detached on purpose: a clip takes ~15-20 min on the instance's two
+          # vCPUs and the deploy must not sit there for an hour. Results appear
+          # in the dashboard clip by clip as each one finishes.
+          # flock -n makes a second deploy skip rather than start a rival
+          # rebuild over the same files, and nice keeps the app responsive
+          # while it runs. main.py only re-analyses clips whose stored
+          # fingerprint differs from the current detection/tracking/CASA code,
+          # so a docs-only push rebuilds nothing.
+          ssh -i ~/.ssh/deploy.pem "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" '
+            cd ~/sperm_CASA
+            setsid flock -n videos/rebuild.lock \
+              nice -n 10 .venv/bin/python main.py --rebuild \
+              >> videos/rebuild.log 2>&1 < /dev/null &
+            echo "rebuild dispatched — tail ~/sperm_CASA/videos/rebuild.log to watch"
+          '
