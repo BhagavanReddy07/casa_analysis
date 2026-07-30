@@ -12,6 +12,12 @@ reimplementing it. Two project-specific pieces sit around it:
 ByteTrack associates on bounding-box IoU. That is valid here: at 0.495 um/px
 and 49 fps a progressive sperm moves ~2 px per frame against a ~16 px box, so
 consecutive-frame boxes overlap heavily.
+
+IoU alone is *not* enough when two cells cross: both detections then overlap
+both predicted boxes by a similar amount, the cost matrix is near-degenerate
+and the assignment is free to swap the two identities. So we add a
+Kalman-prediction distance term to the cost (see :class:`_MotionBYTETracker`),
+which stays discriminative while the boxes overlap.
 """
 
 from __future__ import annotations
@@ -69,11 +75,27 @@ class TrackerConfig:
     dedupe_distance: float = 10.0     # px between head keypoints
     min_track_length: int = 10        # frames, used when reporting
 
+    # Crossing cells: how much of the association cost comes from the distance
+    # to the Kalman-predicted position instead of from box overlap, and the
+    # displacement that scores a full unit of it. The two are *blended*, not
+    # summed — match_thresh already sits near its ceiling at 0.95, so adding a
+    # term on top pushes legitimate re-acquisitions after an occlusion over the
+    # threshold and spawns a fresh ID, which is the failure it was meant to
+    # fix. Calibration knob: raise motion_weight if IDs still swap at
+    # crossings, lower it if fast cells fragment.
+    motion_weight: float = 0.35
+    motion_gate: float = 25.0         # px, ~1.5 box widths
+
+    # A detection this close to a live track's last head continues that
+    # identity. Measured frame-to-frame head displacement is ~11 px on 38.mp4.
+    claim_distance: float = 12.0
+
 
 # Keys BYTETracker reads off its args namespace; the rest are ours.
 _BYTETRACK_KEYS = (
     "track_high_thresh", "track_low_thresh", "new_track_thresh",
     "track_buffer", "match_thresh", "fuse_score",
+    "motion_weight", "motion_gate",
 )
 
 
@@ -92,6 +114,26 @@ class _DetectionBoxes:
         self.cls = np.zeros(len(detections), dtype=np.float32)
 
 
+class _MotionBYTETracker(BYTETracker):
+    """ByteTrack with the Kalman-predicted position folded into the cost.
+
+    Overlap-only costs tie when two cells cross; the distance between a
+    detection and each track's *predicted* centre does not, because the two
+    tracks predict forward along their own velocities.
+    """
+
+    def get_dists(self, tracks, detections):
+        dists = super().get_dists(tracks, detections)
+        if not len(tracks) or not len(detections):
+            return dists
+        pred = np.array([t.xywh[:2] for t in tracks], dtype=np.float32)
+        obs = np.array([d.xywh[:2] for d in detections], dtype=np.float32)
+        gap = np.linalg.norm(pred[:, None, :] - obs[None, :, :], axis=2)
+        motion = np.minimum(gap / self.args.motion_gate, 1.0)
+        w = self.args.motion_weight
+        return (1.0 - w) * dists + w * motion
+
+
 class SpermTracker:
     """Assigns stable IDs to per-frame detections."""
 
@@ -100,19 +142,45 @@ class SpermTracker:
         self.frame_rate = frame_rate
         self._tracker = self._new_tracker()
         self.duplicates_removed = 0
+        self._last_heads: dict[int, tuple[int, tuple[float, float]]] = {}
 
     def _new_tracker(self) -> BYTETracker:
         args = SimpleNamespace(**{k: v for k, v in asdict(self.config).items()
                                   if k in _BYTETRACK_KEYS})
-        return BYTETracker(args, frame_rate=int(round(self.frame_rate)))
+        return _MotionBYTETracker(args, frame_rate=int(round(self.frame_rate)))
 
     def reset(self) -> None:
         """Drop all state — call between videos."""
         self._tracker = self._new_tracker()
         self.duplicates_removed = 0
+        self._last_heads = {}
+
+    def _claims(self, detections: list[Detection]) -> list[int | None]:
+        """Which live identity each detection continues, at most one each.
+
+        Greedy nearest-first so two converging cells claim their own two IDs
+        instead of both claiming the nearer one.
+        """
+        pairs = sorted(
+            (np.hypot(det.head[0] - head[0], det.head[1] - head[1]), i, tid)
+            for i, det in enumerate(detections)
+            for tid, (_, head) in self._last_heads.items()
+        )
+        claims: list[int | None] = [None] * len(detections)
+        taken: set[int] = set()
+        for dist, i, tid in pairs:
+            if dist < self.config.claim_distance and claims[i] is None and tid not in taken:
+                claims[i] = tid
+                taken.add(tid)
+        return claims
 
     def _dedupe(self, detections: list[Detection]) -> list[Detection]:
         """Drop the weaker of any two detections whose heads nearly coincide.
+
+        Two detections that each continue a *different* live identity are two
+        real cells passing close, not one cell detected twice — suppressing
+        either one kills its track and respawns it under a new ID on the way
+        out of the crossing, so both are kept.
 
         ponytail: O(n^2) over ~15 cells per frame. Switch to a KD-tree only if
         cell counts reach the hundreds.
@@ -120,14 +188,18 @@ class SpermTracker:
         if len(detections) < 2:
             return detections
 
-        ordered = sorted(detections, key=lambda d: d.confidence, reverse=True)
-        kept: list[Detection] = []
-        for det in ordered:
+        claims = self._claims(detections)
+        order = sorted(range(len(detections)),
+                       key=lambda i: detections[i].confidence, reverse=True)
+        kept: list[tuple[Detection, int | None]] = []
+        for i in order:
+            det = detections[i]
             if all(np.hypot(det.head[0] - k.head[0], det.head[1] - k.head[1])
-                   >= self.config.dedupe_distance for k in kept):
-                kept.append(det)
+                   >= self.config.dedupe_distance or (claims[i] is not None and kc is not None)
+                   for k, kc in kept):
+                kept.append((det, claims[i]))
         self.duplicates_removed += len(detections) - len(kept)
-        return kept
+        return [det for det, _ in kept]
 
     def update(self, detections: list[Detection], frame_index: int) -> list[Track]:
         """Associate this frame's detections with existing tracks."""
@@ -135,11 +207,19 @@ class SpermTracker:
 
         # Column layout of BYTETracker.update: x1,y1,x2,y2,track_id,score,cls,idx
         rows = self._tracker.update(_DetectionBoxes(detections))
-        return [
+        tracks = [
             Track(track_id=int(row[4]), frame_index=frame_index,
                   detection=detections[int(row[7])])
             for row in rows
         ]
+
+        # Heads of live identities, so _dedupe can tell a crossing from a
+        # double-fire. Retire them on the same buffer the tracker uses.
+        self._last_heads.update({t.track_id: (frame_index, t.detection.head) for t in tracks})
+        buffer = self.config.track_buffer * self.frame_rate / 30.0
+        self._last_heads = {tid: v for tid, v in self._last_heads.items()
+                            if frame_index - v[0] <= buffer}
+        return tracks
 
 
 if __name__ == "__main__":
@@ -149,9 +229,9 @@ if __name__ == "__main__":
     cfg = TrackerConfig()
     tracker = SpermTracker(cfg, frame_rate=49.0)
 
-    def cell(x: float, conf: float = 0.9) -> Detection:
-        return Detection(bbox=(x - 8, 92.0, x + 8, 108.0), head=(x, 100.0),
-                         neck=(x - 10, 100.0), confidence=conf)
+    def cell(x: float, conf: float = 0.9, y: float = 100.0) -> Detection:
+        return Detection(bbox=(x - 8, y - 8, x + 8, y + 8), head=(x, y),
+                         neck=(x - 10, y), confidence=conf)
 
     ids = []
     for i in range(40):
@@ -166,5 +246,23 @@ if __name__ == "__main__":
     assert tracker.duplicates_removed == 0, "reset did not clear counters"
     tracker.update([cell(100.0, 0.9), cell(104.0, 0.6)], 0)   # 4 px apart -> duplicate
     assert tracker.duplicates_removed == 1, "duplicate head was not suppressed"
+
+    # Two cells crossing head-on, 4 px apart at closest approach: both must
+    # survive the crossing and come out the other side with the ID they went in
+    # with (the failure this guards is a swap, or a respawn under a new ID).
+    tracker.reset()
+    seen: dict[int, list[float]] = {}
+    for i in range(40):
+        left, right = 40.0 + 3.0 * i, 160.0 - 3.0 * i
+        for t in tracker.update([cell(left, y=98.0), cell(right, y=102.0)], i):
+            seen.setdefault(t.track_id, []).append(t.detection.head[0])
+
+    long_lived = {tid: xs for tid, xs in seen.items() if len(xs) >= 30}
+    assert len(long_lived) == 2, f"crossing did not yield two stable IDs: {
+        {tid: len(xs) for tid, xs in seen.items()}}"
+    for tid, xs in long_lived.items():
+        steps = np.diff(xs)
+        assert (steps > 0).all() or (steps < 0).all(), \
+            f"ID {tid} reversed direction — it was swapped onto the other cell"
 
     print("tracker.py self-check passed")
