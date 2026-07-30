@@ -34,7 +34,34 @@ one candidate. No amount of cost tuning fixes that. Steps 1 and 4 do.
 
 ---
 
-## Step 0 — Ground truth (do this first)
+## Step 0 — Ground truth — **done for 22.mp4**
+
+The 501 hand-annotated frames in `sperm1/` turned out to be frames 0-500 of
+22.mp4. They had boxes but no identities, so `evaluation/track_eval.py`
+prefilled identities from the tracker, flagged the 207 doubtful moments,
+rendered them as a review video, and a human corrected five of them
+(`data/raw/corrections.csv`). 489 cells the annotator never boxed were added
+from the model's own detections after checking the crops were real sperm.
+
+First real measurement, on the corrected key:
+
+| | ID switches | IDF1 | MOTA | fragmentations |
+|---|---|---|---|---|
+| tracker before 2026-07-30 | 10 | 0.982 | 0.978 | 11 |
+| tracker after | **6** | 0.975 | 0.979 | 9 |
+
+**−40% identity switches**, which is the number the whole plan is about. IDF1
+is marginally worse because the new version reports a few more false positives
+(58 against 52); it also misses fewer real cells (44 against 54).
+
+One caveat to remember when reading these: the key was prefilled *by* the
+current tracker and then corrected, which biases in its favour. The bias is
+mild — the older tracker still scores better on IDF1 — but a second video
+labelled from scratch would settle it.
+
+The rest of this section is what it took, and what a second video would need.
+
+### The original plan
 
 **Why.** Right now neither of us can prove a change helped. Everything I
 measured today used stand-ins: "a track reversed direction" or "a dead cell

@@ -9,7 +9,8 @@ question for this data and needs no re-annotation.
 
 Two modes::
 
-    python -m evaluation.track_eval prefill    # writes a reviewable gt.txt
+    python -m evaluation.track_eval prefill    # writes a reviewable key
+    python -m evaluation.track_eval apply      # re-apply corrections.csv, no detector
     python -m evaluation.track_eval review     # video of just the doubtful moments
     python -m evaluation.track_eval score      # IDF1 / ID switches / MOTA
 
@@ -39,6 +40,8 @@ logger = logging.getLogger(__name__)
 
 FRAMES_DIR = Path("sperm1/sperm1_frames")
 LABELS_DIR = Path("sperm1/sperm1/obj_train_data")
+GT_RAW_PATH = Path("data/raw/gt_prefill.txt")
+CORRECTIONS_PATH = Path("data/raw/corrections.csv")
 GT_PATH = Path("data/raw/gt.txt")
 FLAGS_PATH = Path("data/raw/gt_flags.csv")
 CROPS_PATH = Path("data/raw/unlabelled_crops.png")
@@ -140,12 +143,13 @@ def prefill(source: Path, config: Config, tracker_config: TrackerConfig) -> None
                          f"{hy - ADDED_BOX[1] / 2:.1f},{ADDED_BOX[0]:.1f},{ADDED_BOX[1]:.1f},"
                          f"0.5,1,1")
 
-    GT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    GT_PATH.write_text("\n".join(lines) + "\n")
+    GT_RAW_PATH.parent.mkdir(parents=True, exist_ok=True)
+    GT_RAW_PATH.write_text("\n".join(lines) + "\n")
     FLAGS_PATH.write_text("\n".join(flags) + "\n")
     _crop_sheet(frames, unmatched_heads)
+    apply_corrections()
 
-    logger.info("%d boxes given an identity -> %s", len(lines), GT_PATH)
+    logger.info("%d boxes given an identity -> %s", len(lines), GT_RAW_PATH)
     logger.info("%d flagged for review -> %s", len(flags) - 1, FLAGS_PATH)
     logger.info("%d detections outside every annotated box -> %s (are these cells?)",
                 len(unmatched_heads), CROPS_PATH)
@@ -168,6 +172,53 @@ def _crop_sheet(frames: list[Path], heads: list[tuple[int, tuple[float, float]]]
         r, c = divmod(n, columns)
         sheet[r * size:(r + 1) * size, c * size:(c + 1) * size] = image[y:y + size, x:x + size]
     cv2.imwrite(str(CROPS_PATH), sheet)
+
+
+def apply_corrections() -> None:
+    """Rewrite the prefilled key with the human's fixes from corrections.csv.
+
+    Kept separate from ``prefill`` and applied to a pristine copy each time, so
+    corrections can be edited and re-applied without re-running the detector,
+    and so a mistake in the file can never compound into the key.
+
+    Three actions, frame range inclusive::
+
+        16,37,swap,16,17       # these two identities are on each other's cell
+        118,142,relabel,4,13   # boxes numbered 4 here are really cell 13
+        129,142,drop,19,       # this box is not a sperm at all
+    """
+    rows = [line.split(",") for line in GT_RAW_PATH.read_text().splitlines()]
+    edits: list[tuple[int, int, str, int, int]] = []
+    if CORRECTIONS_PATH.exists():
+        for line in CORRECTIONS_PATH.read_text().splitlines():
+            line = line.split("#")[0].strip()
+            if not line:
+                continue
+            start, end, action, a, b = (line.split(",") + [""])[:5]
+            edits.append((int(start), int(end), action.strip(), int(a), int(b or 0)))
+
+    kept: list[str] = []
+    changed = dropped = 0
+    for row in rows:
+        frame, tid = int(row[0]) - 1, int(row[1])
+        drop = False
+        for start, end, action, a, b in edits:
+            if not start <= frame <= end:
+                continue
+            if action == "swap" and tid in (a, b):
+                tid, changed = (b if tid == a else a), changed + 1
+            elif action == "relabel" and tid == a:
+                tid, changed = b, changed + 1
+            elif action == "drop" and tid == a:
+                drop = True
+        if drop:
+            dropped += 1
+            continue
+        kept.append(",".join([row[0], str(tid), *row[2:]]))
+
+    GT_PATH.write_text("\n".join(kept) + "\n")
+    logger.info("%d corrections applied: %d identities changed, %d boxes dropped -> %s",
+                len(edits), changed, dropped, GT_PATH)
 
 
 def review() -> None:
@@ -249,15 +300,23 @@ def score(config: Config, tracker_config: TrackerConfig) -> None:
         gt_boxes = [box for _, box in truth.get(index, [])]
         hypothesis_ids = [t.track_id for t in tracks]
 
-        # Distance in [0, 1] when the head sits inside the box, else no match.
+        # Distance in [0, 1] when the head sits inside the box, else no match —
+        # and only for the *nearest* box containing it. The hand-drawn boxes are
+        # whole-cell and overlap their neighbours, so a head is often inside two
+        # of them; allowing both lets the matcher pair an identity with a box it
+        # is not on, which hid every swap this file exists to count (measured: 2
+        # reported against 5 known from human review).
         distances = np.full((len(gt_boxes), len(tracks)), np.nan)
-        for i, box in enumerate(gt_boxes):
-            cx, cy = _centre(box)
+        for j, track in enumerate(tracks):
+            head = track.detection.head
+            containing = [(np.hypot(head[0] - _centre(b)[0], head[1] - _centre(b)[1]), i)
+                          for i, b in enumerate(gt_boxes) if _inside(b, head)]
+            if not containing:
+                continue
+            gap, i = min(containing)
+            box = gt_boxes[i]
             radius = max(box[2] - box[0], box[3] - box[1]) / 2
-            for j, track in enumerate(tracks):
-                head = track.detection.head
-                if _inside(box, head):
-                    distances[i, j] = min(1.0, np.hypot(head[0] - cx, head[1] - cy) / radius)
+            distances[i, j] = min(1.0, gap / radius)
         accumulator.update(gt_ids, hypothesis_ids, distances)
 
     metrics = mm.metrics.create()
@@ -270,17 +329,23 @@ def score(config: Config, tracker_config: TrackerConfig) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("mode", choices=["prefill", "review", "score"])
+    parser.add_argument("mode", choices=["prefill", "apply", "review", "score"])
+    parser.add_argument("--baseline", action="store_true",
+                        help="score the tracker as it was before today's changes")
     parser.add_argument("--source", type=Path, default=Path("videos/input/22.mp4"))
     parser.add_argument("--weights", type=Path, default=Path("models/best.pt"))
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    tracker_config = TrackerConfig()
+    tracker_config = (TrackerConfig(motion_weight=0.0, claim_distance=0.0,
+                                    stationary_penalty=0.0)
+                      if args.baseline else TrackerConfig())
     config = Config(weights=args.weights, conf=tracker_config.track_low_thresh)
 
     if args.mode == "prefill":
         prefill(args.source, config, tracker_config)
+    elif args.mode == "apply":
+        apply_corrections()
     elif args.mode == "review":
         review()
     else:
