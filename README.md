@@ -210,23 +210,29 @@ so a bigger box changes little; the point is a stable URL, not speed.
    The CPU wheel index matters — the default pulls ~2 GB of CUDA that does
    nothing on a CPU box.
 
-### Moving to a GPU instance
+### Switching between CPU and GPU instances
 
-Changing the instance type is not enough on its own. The CPU wheel above cannot
-use a GPU no matter what hardware it runs on, and a stock Ubuntu AMI has no
-driver, so the box would quietly keep running on the CPU. With the instance
-**stopped**, change the type (g4dn.xlarge and up), start it, then:
+Stop the instance, change its type, start it. Nothing else — the pieces that
+matter persist on the root volume and the deploy repairs the rest.
+
+The first move to a GPU type needs the driver installed once:
 
 ```bash
-sudo apt update && sudo apt install -y nvidia-driver-535 && sudo reboot   # skip on a Deep Learning AMI
-nvidia-smi                                                               # must list the GPU
-cd ~/sperm_CASA
-.venv/bin/pip install --force-reinstall torch torchvision   --index-url https://download.pytorch.org/whl/cu121
+sudo apt-get install -y linux-headers-$(uname -r) nvidia-driver-575-server
+sudo reboot
+nvidia-smi          # must list the GPU
 ```
 
-Nothing in the code changes: `device` is left unset in `utils/config.py`, so
-ultralytics picks CUDA when it is there. To confirm, the first line of any run
-now names the device it actually used:
+That driver stays on the EBS volume, so later switches in either direction need
+nothing. The CUDA torch build is correct on both kinds of instance — on a CPU
+box it simply reports no GPU — and if a deploy ever leaves a CPU-only wheel on
+a GPU box, the workflow detects the mismatch and reinstalls CUDA torch by
+itself.
+
+Nothing in the code changes either: `device` is left unset in
+`utils/config.py`, so ultralytics picks CUDA when it is genuinely available.
+Every run names the device it actually used, which is the quickest way to tell
+a working GPU from a silent fallback:
 
 ```
 classes={0: 'sperm'} device=cuda (Tesla T4)

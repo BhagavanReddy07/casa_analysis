@@ -44,6 +44,21 @@ jobs:
             set -e
             cd ~/sperm_CASA
             .venv/bin/pip install -q -r requirements.txt
+
+            # The instance type gets switched between CPU and GPU sizes, and a
+            # CPU-only torch wheel on a GPU box runs silently at a twentieth of
+            # the speed — nothing fails, it is just slow. So the deploy checks
+            # the hardware against the wheel and repairs the mismatch itself
+            # rather than relying on anyone remembering. The CUDA build is
+            # correct on both: on a CPU instance it simply reports no GPU.
+            if nvidia-smi >/dev/null 2>&1 && \
+               .venv/bin/python -c "import torch,sys; sys.exit(0 if \"+cpu\" in torch.__version__ else 1)"; then
+              echo "GPU present but torch is the CPU build - reinstalling with CUDA"
+              .venv/bin/pip install -q --force-reinstall torch torchvision \
+                --index-url https://download.pytorch.org/whl/cu124
+            fi
+            .venv/bin/python -c "import torch; print(\"torch\", torch.__version__, \"cuda:\", torch.cuda.is_available())"
+
             sudo systemctl restart casa
           '
 
