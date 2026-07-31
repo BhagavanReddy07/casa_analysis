@@ -90,7 +90,7 @@ def load_key(dataset: Dataset) -> key_module.Key:
         return pickle.loads(cached.read_bytes())
     frames = dataset.frames
     height, width = cv2.imread(str(frames[0])).shape[:2]
-    built = key_module.build(frames, key_module.load_boxes(dataset.labels_dir, width, height))
+    built = key_module.build(frames, key_module.load_shapes(dataset.root, width, height))
     cached.parent.mkdir(parents=True, exist_ok=True)
     cached.write_bytes(pickle.dumps(built))
     return built

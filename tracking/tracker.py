@@ -84,15 +84,15 @@ class TrackerConfig:
     # fix. Calibration knob: raise motion_weight if IDs still swap at
     # crossings, lower it if fast cells fragment.
     #
-    # Replaying 600 cached frames of all four clips through the tracker,
-    # against the baseline of no motion term and no crossing exemption below
-    # (112 tracks / 89 usable / 18.0 mean gaps / 29 heading reversals / 884
-    # detections suppressed as duplicates): 118 / 91 / 17.5 / 23 / 627. A
-    # heading reversal mid-track is a cell handing its ID to another one, so
-    # that count is the swap proxy. Weight is flat between 0.25 and 0.5; the
-    # gate matters more â€” 20 px gives 25 reversals, 25 px gives 24 plus a
-    # position jump, so a gate near one box width wins.
-    motion_weight: float = 0.35
+    # Chosen on the union of the three annotated clips, not on one of them
+    # (python -m evaluation.score --dataset spermN --sweep). Across 22, 30 and
+    # 38.mp4 a weight of 0.5 gives 9 identity switches against 10 at 0.35, with
+    # the same number of missed cells and one fewer fragmentation. Dropping the
+    # term entirely costs 2 more switches on 22.mp4.
+    #
+    # The gate matters more than the weight: 10 px costs a switch on 38.mp4 and
+    # 25 px costs IDF1 on every clip, so it stays near one box width.
+    motion_weight: float = 0.5
     motion_gate: float = 15.0         # px, ~one box width
 
     # A detection this close to a live track's last head continues that

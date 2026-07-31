@@ -89,6 +89,33 @@ Kept here so none of it is attempted again by accident.
 None of these is a cost-function problem. Two are genuine ambiguity at a
 crossing, one is an edge artefact.
 
+### All three clips (final)
+
+| clip | frames | cells/frame | identity switches |
+|---|---|---|---|
+| 22.mp4 | 501 | ~10 | 3 |
+| 30.mp4 | 301 | ~7 | 4 |
+| 38.mp4 | 300 | ~11 | **2** |
+
+38.mp4 — the crowded clip the whole investigation started from — is the one the
+tracker handles best. `motion_weight` was raised from 0.35 to 0.5 on the union
+of all three (9 switches against 10, same misses, one fewer fragmentation);
+every other setting is flat or worse on at least one clip.
+
+Two things the third annotation taught us, both worth remembering:
+
+* **CVAT's YOLO 1.1 export silently drops rotated boxes.** 1,204 of 3,618
+  shapes vanished, and the clip looked under-annotated by 5 cells a frame. Use
+  **CVAT for images 1.1** (XML) for anything with rotated shapes;
+  `evaluation/key.py` reads it and prefers it wherever it exists.
+* **Agglutinated cells break a head-point key.** A clump of two or three heads
+  is correctly boxed as one sperm, but "the brightest point inside the box"
+  then alternates between its heads, which reads as an identity switch that
+  never happened — one clump produced 7 of 10 reported switches on 38.mp4.
+  Identities whose head hops repeatedly while the cell goes nowhere are now
+  excluded from the key (1 on 38.mp4, 2 on 30.mp4, 0 on 22.mp4). They are still
+  tracked; they are just not evidence.
+
 ### Validated on a second clip
 
 A 301-frame annotation of 30.mp4 arrived after the above and was scored without
