@@ -72,7 +72,15 @@ class TrackerConfig:
     match_thresh: float = 0.95
     fuse_score: bool = True
 
-    dedupe_distance: float = 10.0     # px between head keypoints
+    # px between head keypoints. Raised from 10 after measuring what a viewer
+    # actually sees — following each cell through the tracker's own output by
+    # position and counting how often its number changes. Across the three
+    # clips that count went from 9 to 7, and on 38.mp4 alone from 6 to 4, with
+    # no change in identity swaps. The cells it helps are agglutinated clumps,
+    # where the detector splits one sperm into two or three heads a few pixels
+    # apart and each split spawns a competing identity; 38.mp4 has 904 such
+    # suppressions against 78 on 22.mp4.
+    dedupe_distance: float = 14.0
     min_track_length: int = 10        # frames, used when reporting
 
     # Crossing cells: how much of the association cost comes from the distance
@@ -98,7 +106,6 @@ class TrackerConfig:
     # A detection this close to a live track's last head continues that
     # identity. Measured frame-to-frame head displacement is ~11 px on 38.mp4.
     claim_distance: float = 12.0
-
 
 # Keys BYTETracker reads off its args namespace; the rest are ours.
 _BYTETRACK_KEYS = (
@@ -166,7 +173,9 @@ class _MotionBYTETracker(BYTETracker):
         # penalty it is zero for a plausible match and only ever pushes an
         # implausible one out of reach.
         w_m = self.args.motion_weight
-        return (1.0 - w_m) * dists + w_m * motion
+        cost = (1.0 - w_m) * dists + w_m * motion
+
+        return cost
 
 
 class SpermTracker:
