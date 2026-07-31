@@ -154,9 +154,21 @@ def load_metrics(csv_path: str, mtime: float) -> pd.DataFrame:
     return pd.read_csv(csv_path)
 
 
-def unprocessed_videos() -> list[Path]:
+def unprocessed_videos() -> tuple[list[Path], list[Path]]:
+    """Clips with no results, split into never-run and ran-but-found-nothing.
+
+    A clip the detector found no sperm in produces a tracked video but no
+    metrics CSV, so it can never join the sample list. Calling that "not yet
+    analysed" invites the viewer to upload it again and get the same silence,
+    which is why the two cases are told apart here.
+    """
     done = set(processed_videos())
-    return [p for p in sorted(INPUT_DIR.glob("*.mp4")) if p.stem not in done]
+    waiting, empty = [], []
+    for path in sorted(INPUT_DIR.glob("*.mp4")):
+        if path.stem in done:
+            continue
+        (empty if (OUTPUT_DIR / f"{path.stem}_tracked.mp4").exists() else waiting).append(path)
+    return waiting, empty
 
 
 def grade_counts(df: pd.DataFrame) -> dict[str, int]:
@@ -467,7 +479,7 @@ def main() -> None:
         return
 
     videos = processed_videos()
-    pending = unprocessed_videos()
+    pending, found_nothing = unprocessed_videos()
 
     with st.sidebar:
         st.markdown("### 🔬 Sperm CASA")
@@ -483,6 +495,11 @@ def main() -> None:
 
         if pending:
             st.caption("Not yet analysed: " + ", ".join(p.stem for p in pending))
+        if found_nothing:
+            st.caption("Analysed, no sperm found: " + ", ".join(p.stem for p in found_nothing))
+            st.caption("Re-uploading will not help — the footage is at a "
+                       "different magnification from what the model was "
+                       "trained on. See the upload panel for details.")
 
         st.divider()
         st.markdown("**Analyse a new video**")
