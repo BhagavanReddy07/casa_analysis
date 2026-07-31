@@ -209,6 +209,33 @@ so a bigger box changes little; the point is a stable URL, not speed.
    ```
    The CPU wheel index matters — the default pulls ~2 GB of CUDA that does
    nothing on a CPU box.
+
+### Moving to a GPU instance
+
+Changing the instance type is not enough on its own. The CPU wheel above cannot
+use a GPU no matter what hardware it runs on, and a stock Ubuntu AMI has no
+driver, so the box would quietly keep running on the CPU. With the instance
+**stopped**, change the type (g4dn.xlarge and up), start it, then:
+
+```bash
+sudo apt update && sudo apt install -y nvidia-driver-535 && sudo reboot   # skip on a Deep Learning AMI
+nvidia-smi                                                               # must list the GPU
+cd ~/sperm_CASA
+.venv/bin/pip install --force-reinstall torch torchvision   --index-url https://download.pytorch.org/whl/cu121
+```
+
+Nothing in the code changes: `device` is left unset in `utils/config.py`, so
+ultralytics picks CUDA when it is there. To confirm, the first line of any run
+now names the device it actually used:
+
+```
+classes={0: 'sperm'} device=cuda (Tesla T4)
+classes={0: 'sperm'} device=cpu — torch 2.7.0+cpu has no CUDA support
+```
+
+The Elastic IP survives the stop/start, so `EC2_HOST` stays valid and the next
+push deploys as usual. Deploys do not disturb the CUDA build: `torch` is not
+pinned in `requirements.txt`, and pip leaves a satisfying version alone.
 4. Run as a service so it survives reboots:
    ```ini
    # /etc/systemd/system/casa.service

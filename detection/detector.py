@@ -48,7 +48,20 @@ class SpermDetector:
         logger.info("loading %s", weights)
         self.model = YOLO(str(weights))
         self.dropped_keypoints = 0
-        logger.info("classes=%s device=%s", self.model.names, self.config.device or "auto")
+        # Report the device actually in use, not what was asked for. A CPU-only
+        # torch wheel on a GPU instance runs silently on the CPU at a twentieth
+        # of the speed, and nothing else in the logs would say so.
+        logger.info("classes=%s device=%s", self.model.names, self._device())
+
+    def _device(self) -> str:
+        import torch
+
+        if self.config.device:
+            return str(self.config.device)
+        if torch.cuda.is_available():
+            return f"cuda ({torch.cuda.get_device_name(0)})"
+        return f"cpu — torch {torch.__version__} has no CUDA support" \
+            if "+cpu" in torch.__version__ else "cpu (no GPU visible)"
 
     def detect(self, frame: np.ndarray) -> list[Detection]:
         """Run the model on a single BGR frame."""
