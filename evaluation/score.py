@@ -52,12 +52,29 @@ class Dataset:
     name: str
 
     @property
+    def root(self) -> Path:
+        return Path(self.name)
+
+    @property
     def frames_dir(self) -> Path:
-        return Path(self.name) / f"{self.name}_frames"
+        """Wherever the images ended up — CVAT exports nest inconsistently."""
+        return self._find("*.png")
 
     @property
     def labels_dir(self) -> Path:
-        return Path(self.name) / self.name / "obj_train_data"
+        return self._find("*.txt")
+
+    def _find(self, pattern: str) -> Path:
+        """Deepest folder under the clip that holds files of this kind.
+
+        Each export has landed with a different amount of nesting, and
+        rearranging folders by hand is a good way to pair labels with the wrong
+        frames. Searching is cheaper than being strict.
+        """
+        candidates = {path.parent for path in self.root.rglob(pattern)}
+        if not candidates:
+            raise FileNotFoundError(f"no {pattern} under {self.root}")
+        return max(candidates, key=lambda p: (len(list(p.glob(pattern))), len(p.parts)))
 
     @property
     def frames(self) -> list[Path]:
