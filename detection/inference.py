@@ -68,7 +68,18 @@ def run_video(
     if not cap.isOpened():
         raise RuntimeError(f"cannot open video source: {source}")
 
+    # Every velocity in the CASA report is frames-per-second times pixels, so a
+    # wrong frame rate scales every result with it. Cameras and converters do
+    # write nonsense here — an uploaded clip declared 1000 fps, which would
+    # have reported VCL twenty times too high had any cell been detected.
+    # Anything outside what a microscope camera plausibly produces is refused
+    # in favour of the known rig rate.
     fps = cap.get(cv2.CAP_PROP_FPS) or FALLBACK_FPS
+    if not 5.0 <= fps <= 240.0:
+        logger.warning("video claims %.1f fps, which is not a plausible capture rate — "
+                       "using %.1f instead; velocities would otherwise be wrong by %.0fx",
+                       fps, FALLBACK_FPS, fps / FALLBACK_FPS)
+        fps = FALLBACK_FPS
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))

@@ -414,8 +414,9 @@ def render_upload(tracker_config: TrackerConfig) -> None:
 
     st.caption(f"**{uploaded.name}** · {size_mb:.1f} MB")
     if not st.button("Run analysis", type="primary", use_container_width=True):
-        st.caption("Runs at 4-6 frames/second here, so a 30-second clip takes "
-                   "several minutes. Keep this tab open.")
+        st.caption("The page is frozen while this runs and the tab must stay "
+                   "open. On the GPU a 30-second clip takes about half a "
+                   "minute; long recordings take proportionally longer.")
         return
 
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -426,7 +427,7 @@ def render_upload(tracker_config: TrackerConfig) -> None:
     config.draw.show_conf = False
     config.draw.trail_length = 0
 
-    with st.spinner("Analysing…"):
+    with st.spinner("Analysing… the page stays frozen until this finishes."):
         try:
             detector = SpermDetector(config)
             run(detector, str(destination), config, track=True, metrics=True,
@@ -434,6 +435,23 @@ def render_upload(tracker_config: TrackerConfig) -> None:
         except Exception as exc:  # surface the failure instead of a blank page
             st.error(f"Analysis failed: {exc}")
             return
+
+    # A finished run is not the same as a usable one. When the detector finds
+    # nothing — footage at a different magnification, say — there are no
+    # trajectories, no CSV is written, and the clip cannot appear in the sample
+    # list. Saying "Done" and leaving the list unchanged reads as a broken
+    # upload, so the reason is stated instead.
+    if not (OUTPUT_DIR / f"{destination.stem}_metrics.csv").exists():
+        st.error(
+            f"**{destination.stem}** was analysed but no sperm were found, so "
+            "there is nothing to report.\n\n"
+            "The model was trained on 400x phase-contrast footage where a head "
+            "is a bright spot roughly 16 px across with a visible tail. Video "
+            "at a lower magnification — cells as small dark dots — looks "
+            "nothing like that to it and will come back empty. The annotated "
+            "video is still saved if you want to look at it."
+        )
+        return
 
     load_metrics.clear()
     st.success(f"Done — **{destination.stem}** is now in the sample list.")
