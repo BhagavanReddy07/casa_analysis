@@ -34,6 +34,97 @@ one candidate. No amount of cost tuning fixes that. Steps 1 and 4 do.
 
 ---
 
+## Where this actually landed (2026-07-31)
+
+**The tracker makes 2-3 identity errors in 501 frames of 22.mp4**, against a
+ground truth that owes nothing to the tracker. That is the headline, and it is
+much better than it looked all of the previous day, because the measurement was
+wrong before it was right.
+
+Run it with::
+
+    python -m evaluation.score            # switches, IDF1, MOTA, and where they are
+    python -m evaluation.score --sweep    # every setting, one line each
+
+### The measurement was the hard part
+
+Three keys were built before one was trustworthy:
+
+| key | how identities were assigned | switches reported | verdict |
+|---|---|---|---|
+| v1 | copied from our tracker onto each box | 6 | circular, and unstable where boxes overlap |
+| v2 | boxes linked to each other over time | 13 | tracker-independent, but overlap still flips the match |
+| v3 | head point per box from the pixels, then linked | **2-3** | zero teleports; trustworthy |
+
+The trap in v1 and v2 is the same: the annotations are whole-cell boxes about
+58 px across that overlap their neighbours, so "which cell does this detection
+belong to" has no stable answer from boxes alone — and the ambiguity is worst
+at crossings, which is precisely what is being measured. v3 fixes it without
+new annotation: a sperm head is the brightest point under phase contrast, so
+each box only has to *locate* a head the pixels then pin down.
+
+A day of tuning was done against v1 before this was noticed. Every conclusion
+from it was re-derived against v3, and most did not survive.
+
+### What survived, with numbers
+
+| change | effect on 22.mp4 |
+|---|---|
+| Kalman-prediction distance in the association cost | switches 5 -> 3 |
+| keeping both cells when two identities pass close | 9 fewer missed cell-frames, 3 fewer fragmentations, +1 switch |
+
+### What was tried and removed, with numbers
+
+Kept here so none of it is attempted again by accident.
+
+* **A stationary rule** — "a cell that has not moved cannot suddenly move".
+  Correct in principle, and 44% of near-stationary tracks did contain an
+  impossible jump. No effect on any metric at any setting.
+* **A heading rule** — "a swimming cell cannot reverse". Direction has no
+  signal at 49 fps: the median step is 0.4 px and 43% of measured turn angles
+  exceed 90 degrees, i.e. jitter. Forcing it cost 79 position jumps and half
+  again as many identities.
+* **Orientation as a fingerprint** — the strongest signal found all night: a
+  cell's head-to-neck axis moves a median **0.9 degrees** per frame while two
+  neighbouring cells differ by a median **83 degrees**, so 87% of neighbouring
+  pairs are further apart than one cell ever drifts. It changed nothing,
+  because at the frames that fail the per-frame association is already correct.
+  It is the obvious tool for matching identities *across a gap*, which is where
+  it should be tried next.
+* **Withholding contested detections** during a merge — no switches gained, 7
+  more missed cell-frames.
+* **Offline swap repair** at crossings — every setting that fired made things
+  worse (6 switches became 8-10); the only safe threshold was one that never
+  fired.
+* **Detector settings** — NMS from 0.5 to 0.9 cut merges 45 to 36 but added
+  45% more detections; imgsz 1280 cut merges to 29 while quadrupling false
+  positives. Neither is a win.
+
+### The three remaining errors
+
+* **frame 36** — two cells 34 px apart during a long crossing.
+* **frame 129** — two cells 23 px apart; caused by keeping a real cell that
+  then takes a fresh identity. The alternative is deleting it, which trades one
+  switch for nine missed cell-frames.
+* **frame 164** — a cell at the top edge of the frame (y = 3), half out of
+  view. Arguably not an error at all: a cell leaving the frame has ended.
+
+None of these is a cost-function problem. Two are genuine ambiguity at a
+crossing, one is an edge artefact.
+
+### Honest limits
+
+* One clip. 22.mp4 is the *least* crowded of the four; 38.mp4 has the most
+  crossings and no ground truth at all. Numbers here do not transfer to it.
+* 520 "false positives" are real sperm the annotator never boxed. They are
+  constant across settings so comparisons hold, but the absolute MOTA is
+  pessimistic.
+* The tail of the key — 26 identities from 4,814 boxes — is only as good as
+  the head extraction, which assumes the brightest pixel in a box is that
+  cell's head. It has zero teleports, which is the best available check.
+
+---
+
 ## Step 0 — Ground truth — **done for 22.mp4**
 
 The 501 hand-annotated frames in `sperm1/` turned out to be frames 0-500 of

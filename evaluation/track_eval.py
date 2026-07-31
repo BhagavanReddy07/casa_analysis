@@ -46,6 +46,7 @@ GT_PATH = Path("data/raw/gt.txt")
 FLAGS_PATH = Path("data/raw/gt_flags.csv")
 CROPS_PATH = Path("data/raw/unlabelled_crops.png")
 REVIEW_PATH = Path("data/raw/review.mp4")
+DETECTIONS_PATH = Path("data/raw/detections.pkl")
 ADDED_BOX = (58.0, 53.0)          # median hand-drawn box, for machine-added cells
 REVIEW_CONTEXT = 5                # frames either side of a flagged moment
 
@@ -72,6 +73,64 @@ def _inside(box, point) -> bool:
 
 def _centre(box) -> tuple[float, float]:
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+
+
+def link_annotations(boxes: dict[int, list[tuple[float, float, float, float]]],
+                     memory: int = 8, min_iou: float = 0.2) -> dict[int, list[int]]:
+    """Give the hand-drawn boxes identities by following them frame to frame.
+
+    The key must not be built from the tracker's own answers. An earlier
+    version copied tracker identities onto each box by "which head is inside
+    it", and because the boxes are whole-cell and overlap their neighbours,
+    that mapping flipped between two overlapping boxes while the tracker itself
+    was perfectly stable — inventing swaps in the key that were then reported
+    as tracker errors. Traced at frame 16 of 22.mp4: the tracker held both
+    identities cleanly with well-separated costs, and the key flipped anyway.
+
+    Linking the boxes to each other instead is both independent of the tracker
+    and far easier than tracking cells: the boxes are human-drawn, one per cell,
+    58 px across, and move a few pixels per frame. Overlap alone resolves them.
+    ``memory`` carries an identity across the frames where the annotator drew
+    nothing because the head was not visible.
+    """
+    from scipy.optimize import linear_sum_assignment
+
+    def iou(a, b) -> float:
+        x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+        x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+        overlap = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+        if overlap <= 0:
+            return 0.0
+        area = ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - overlap)
+        return overlap / area if area > 0 else 0.0
+
+    identities: dict[int, list[int]] = {}
+    live: dict[int, tuple[int, tuple[float, float, float, float]]] = {}   # id -> (frame, box)
+    next_id = 1
+
+    for frame in sorted(boxes):
+        current = boxes[frame]
+        alive = [(tid, box) for tid, (seen, box) in live.items() if frame - seen <= memory]
+        assigned = [0] * len(current)
+
+        if alive and current:
+            cost = np.array([[1.0 - iou(box, candidate) for candidate in current]
+                             for _, box in alive])
+            rows, cols = linear_sum_assignment(cost)
+            for r, c in zip(rows, cols):
+                if cost[r, c] <= 1.0 - min_iou:
+                    tid = alive[r][0]
+                    assigned[c] = tid
+                    live[tid] = (frame, current[c])
+
+        for index, tid in enumerate(assigned):
+            if not tid:
+                assigned[index] = next_id
+                live[next_id] = (frame, current[index])
+                next_id += 1
+        identities[frame] = assigned
+
+    return identities
 
 
 def prefill(source: Path, config: Config, tracker_config: TrackerConfig) -> None:
@@ -276,7 +335,26 @@ def review() -> None:
                 len(wanted), sum(len(v) for v in trouble.values()), REVIEW_PATH)
 
 
-def score(config: Config, tracker_config: TrackerConfig) -> None:
+def cached_detections(config: Config, frames: list[Path]) -> list[list]:
+    """Detections per frame, cached — the detector is 99% of the runtime here.
+
+    Tracking settings change many times per detector run, so paying two minutes
+    of YOLO for each experiment is the difference between a usable loop and an
+    unusable one. Delete the file after changing weights or the confidence.
+    """
+    import pickle
+
+    if DETECTIONS_PATH.exists():
+        return pickle.loads(DETECTIONS_PATH.read_bytes())
+
+    detector = SpermDetector(config)
+    per_frame = [detector.detect(cv2.imread(str(path))) for path in frames]
+    DETECTIONS_PATH.write_bytes(pickle.dumps(per_frame))
+    logger.info("cached detections for %d frames -> %s", len(per_frame), DETECTIONS_PATH)
+    return per_frame
+
+
+def score(config: Config, tracker_config: TrackerConfig, use_repair: bool = False) -> None:
     """Compare the tracker against the reviewed gt.txt: IDF1, ID switches, MOTA."""
     import motmetrics as mm
 
@@ -290,17 +368,24 @@ def score(config: Config, tracker_config: TrackerConfig) -> None:
             (int(tid), (float(x), float(y), float(x) + float(w), float(y) + float(h))))
 
     frames = sorted(FRAMES_DIR.glob("*.png"))
-    detector = SpermDetector(config)
+    detections = cached_detections(config, frames)
     tracker = SpermTracker(tracker_config, frame_rate=49.0)
     accumulator = mm.MOTAccumulator(auto_id=True)
 
-    for index, path in enumerate(frames):
-        tracks = tracker.update(detector.detect(cv2.imread(str(path))), index)
+    per_frame = {index: tracker.update(list(dets), index)
+                 for index, dets in enumerate(detections)}
+    if use_repair:
+        from tracking.repair import repair
+        per_frame, undone = repair(per_frame)
+        logger.info("repair undid %d swap(s)", undone)
+
+    for index in range(len(frames)):
+        tracks = per_frame[index]
         gt_ids = [tid for tid, _ in truth.get(index, [])]
         gt_boxes = [box for _, box in truth.get(index, [])]
         hypothesis_ids = [t.track_id for t in tracks]
 
-        # Distance in [0, 1] when the head sits inside the box, else no match �
+        # Distance in [0, 1] when the head sits inside the box, else no match �
         # and only for the *nearest* box containing it. The hand-drawn boxes are
         # whole-cell and overlap their neighbours, so a head is often inside two
         # of them; allowing both lets the matcher pair an identity with a box it
@@ -330,6 +415,8 @@ def score(config: Config, tracker_config: TrackerConfig) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("mode", choices=["prefill", "apply", "review", "score"])
+    parser.add_argument("--repair", action="store_true",
+                        help="run the offline swap-repair pass before scoring")
     parser.add_argument("--baseline", action="store_true",
                         help="score the tracker as it was before today's changes")
     parser.add_argument("--source", type=Path, default=Path("videos/input/22.mp4"))
@@ -349,7 +436,7 @@ def main() -> None:
     elif args.mode == "review":
         review()
     else:
-        score(config, tracker_config)
+        score(config, tracker_config, use_repair=args.repair)
 
 
 if __name__ == "__main__":

@@ -23,7 +23,6 @@ which stays discriminative while the boxes overlap.
 from __future__ import annotations
 
 import logging
-from collections import deque
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
 
@@ -53,7 +52,7 @@ class TrackerConfig:
     identity is retired.
 
     ``match_thresh`` is a *distance* threshold (1 - IoU), not a required
-    overlap — despite the name, higher is more lenient. The ultralytics
+    overlap â€” despite the name, higher is more lenient. The ultralytics
     default of 0.8 is tuned for boxes tens of pixels wide; our sperm boxes are
     only ~15 px, so a fast cell's frame-to-frame displacement (measured ~11 px
     on 38.mp4) can be a large fraction of the box width and drop IoU below
@@ -79,7 +78,7 @@ class TrackerConfig:
     # Crossing cells: how much of the association cost comes from the distance
     # to the Kalman-predicted position instead of from box overlap, and the
     # displacement that scores a full unit of it. The two are *blended*, not
-    # summed — match_thresh already sits near its ceiling at 0.95, so adding a
+    # summed â€” match_thresh already sits near its ceiling at 0.95, so adding a
     # term on top pushes legitimate re-acquisitions after an occlusion over the
     # threshold and spawns a fresh ID, which is the failure it was meant to
     # fix. Calibration knob: raise motion_weight if IDs still swap at
@@ -91,7 +90,7 @@ class TrackerConfig:
     # detections suppressed as duplicates): 118 / 91 / 17.5 / 23 / 627. A
     # heading reversal mid-track is a cell handing its ID to another one, so
     # that count is the swap proxy. Weight is flat between 0.25 and 0.5; the
-    # gate matters more — 20 px gives 25 reversals, 25 px gives 24 plus a
+    # gate matters more â€” 20 px gives 25 reversals, 25 px gives 24 plus a
     # position jump, so a gate near one box width wins.
     motion_weight: float = 0.35
     motion_gate: float = 15.0         # px, ~one box width
@@ -100,48 +99,19 @@ class TrackerConfig:
     # identity. Measured frame-to-frame head displacement is ~11 px on 38.mp4.
     claim_distance: float = 12.0
 
-    # A cell that has not moved does not suddenly move. A track whose net
-    # drift over `history_frames` is under `stationary_speed` px/frame is dead
-    # or stuck, and 44% of those currently contain a single step over 4 px
-    # (worst 11 px) — a dead cell cannot do that, so those are motile cells
-    # stealing an immotile identity as they swim past. Beyond
-    # `stationary_gate` the match costs `stationary_penalty`; at 1.0 that is a
-    # hard refusal, and the immotile track sits unmatched until its own cell
-    # reappears rather than being dragged along by the swimmer.
-    #
-    # Net drift, not the median single-frame step: at 49 fps that step is
-    # 0.4 px, which is keypoint noise, and judging on it calls nearly every
-    # cell stationary (measured: 118 tracks became 70, with 201 position
-    # jumps).
-    #
-    # A heading rule belongs here too — a swimming cell does not reverse — but
-    # it was tried and removed. Direction has no signal at this frame rate:
-    # below 1 px/frame the measured turn angle is 43% over 90 degrees, i.e.
-    # pure jitter, and forcing it on cost 79 position jumps and inflated the
-    # track count by half. The neck-to-head axis is no better a substitute: it
-    # sits a median 46-63 degrees off the actual travel direction even at
-    # speed, because the head yaws about the path (which is what ALH measures).
-    # Direction is worth using again only over longer baselines, i.e. when
-    # stitching whole tracklets offline rather than deciding frame by frame.
-    stationary_penalty: float = 1.0   # 1.0 = refuse the match outright
-    stationary_speed: float = 0.5     # px/frame of net drift
-    stationary_gate: float = 6.0      # px a still cell is allowed to jump
-    history_frames: int = 10          # window the rule looks back over
-
 
 # Keys BYTETracker reads off its args namespace; the rest are ours.
 _BYTETRACK_KEYS = (
     "track_high_thresh", "track_low_thresh", "new_track_thresh",
     "track_buffer", "match_thresh", "fuse_score",
     "motion_weight", "motion_gate",
-    "stationary_penalty", "stationary_speed", "stationary_gate", "history_frames",
 )
 
 
 class _DetectionBoxes:
     """Duck-types the ultralytics ``Boxes`` fields that BYTETracker reads.
 
-    Must not expose ``xywhr`` — BYTETracker treats its presence as the oriented
+    Must not expose ``xywhr`` â€” BYTETracker treats its presence as the oriented
     bounding box case.
     """
 
@@ -154,33 +124,29 @@ class _DetectionBoxes:
 
 
 class _MotionBYTETracker(BYTETracker):
-    """ByteTrack that also weighs prediction distance and per-track behaviour.
+    """ByteTrack with the Kalman-predicted position folded into the cost.
 
     Overlap-only costs tie when two cells cross; the distance between a
     detection and each track's *predicted* centre does not, because the two
-    tracks predict forward along their own velocities. On top of that each
-    track carries its own recent history, which rules out the two crossings
-    that geometry alone gets wrong: a dead cell being handed a passing cell's
-    motion, and a swimming cell being asked to reverse.
+    tracks predict forward along their own velocities. Measured against the
+    ground truth in ``evaluation/``: dropping this term takes 22.mp4 from 2
+    identity switches to 5.
+
+    Three richer ideas were tried here and removed, each with numbers, so they
+    are not retried by accident:
+
+    * **a stationary rule** ("a dead cell cannot suddenly move") — no effect on
+      any metric at any setting;
+    * **a heading rule** ("a swimming cell cannot reverse") — direction has no
+      signal at 49 fps, where the median step is 0.4 px and 43% of measured
+      turn angles exceed 90 degrees. Forcing it cost 79 position jumps;
+    * **orientation as an identity fingerprint** — a cell's head-to-neck axis
+      moves a median 0.9 degrees per frame while two neighbouring cells differ
+      by a median 83, which makes it the most discriminative signal available.
+      It still changed nothing, because at the frames that fail the association
+      is already correct and the errors lie elsewhere. Worth revisiting if
+      identities are ever matched across a gap rather than frame to frame.
     """
-
-    def _stationary_cost(self, tracks, obs: np.ndarray) -> np.ndarray:
-        """Per (track, detection) cost in [0, 1] for asking a still cell to move."""
-        cost = np.zeros((len(tracks), len(obs)), dtype=np.float32)
-        window = int(self.args.history_frames)
-        for i, track in enumerate(tracks):
-            history = getattr(track, "casa_history", None)
-            if history is None or len(history) < 3:
-                continue                     # too new to have a habit
-            path = np.array(history, dtype=np.float32)
-            drift = np.linalg.norm(path[-1] - path[max(0, len(path) - window)])
-            if drift / max(1, len(path) - 1) >= self.args.stationary_speed:
-                continue                     # it moves, so it may keep moving
-
-            distance = np.linalg.norm(obs - path[-1], axis=1)
-            cost[i] = np.clip((distance - self.args.stationary_gate)
-                              / self.args.stationary_gate, 0.0, 1.0)
-        return cost
 
     def get_dists(self, tracks, detections):
         dists = super().get_dists(tracks, detections)
@@ -195,15 +161,12 @@ class _MotionBYTETracker(BYTETracker):
         # keeps meaning what it meant. The stationary rule is added on top
         # instead: blending it in would shrink the geometry weight, and a
         # track with no history yet (rule cost 0) would then have a maximum
-        # possible cost below match_thresh — the assignment would accept
+        # possible cost below match_thresh â€” the assignment would accept
         # literally any pairing. Measured: 200 position jumps against 0. As a
         # penalty it is zero for a plausible match and only ever pushes an
         # implausible one out of reach.
-        w_m, penalty = self.args.motion_weight, self.args.stationary_penalty
-        geometry = (1.0 - w_m) * dists + w_m * motion
-        if not penalty:
-            return geometry
-        return np.minimum(geometry + penalty * self._stationary_cost(tracks, obs), 1.0)
+        w_m = self.args.motion_weight
+        return (1.0 - w_m) * dists + w_m * motion
 
 
 class SpermTracker:
@@ -222,7 +185,7 @@ class SpermTracker:
         return _MotionBYTETracker(args, frame_rate=int(round(self.frame_rate)))
 
     def reset(self) -> None:
-        """Drop all state — call between videos."""
+        """Drop all state â€” call between videos."""
         self._tracker = self._new_tracker()
         self.duplicates_removed = 0
         self._last_heads = {}
@@ -250,7 +213,7 @@ class SpermTracker:
         """Drop the weaker of any two detections whose heads nearly coincide.
 
         Two detections that each continue a *different* live identity are two
-        real cells passing close, not one cell detected twice — suppressing
+        real cells passing close, not one cell detected twice â€” suppressing
         either one kills its track and respawns it under a new ID on the way
         out of the crossing, so both are kept.
 
@@ -280,16 +243,6 @@ class SpermTracker:
         # Column layout of BYTETracker.update: x1,y1,x2,y2,track_id,score,cls,idx
         rows = self._tracker.update(_DetectionBoxes(detections))
 
-        # Each track remembers where it has actually been, which is what the
-        # stationary and heading rules read next frame. A lost track keeps the
-        # history it had, so it is still judged on how it was moving when it
-        # was last seen.
-        for strack in self._tracker.tracked_stracks:
-            history = getattr(strack, "casa_history", None)
-            if history is None:
-                history = strack.casa_history = deque(maxlen=self.config.history_frames)
-            history.append(tuple(strack.xywh[:2]))
-
         tracks = [
             Track(track_id=int(row[4]), frame_index=frame_index,
                   detection=detections[int(row[7])])
@@ -306,7 +259,7 @@ class SpermTracker:
 
 
 if __name__ == "__main__":
-    # ponytail: one self-check instead of a suite — a cell drifting 2 px/frame
+    # ponytail: one self-check instead of a suite â€” a cell drifting 2 px/frame
     # (our measured speed) must keep a single ID, survive a two-frame dropout,
     # and duplicate heads must collapse to one identity.
     cfg = TrackerConfig()
@@ -346,7 +299,7 @@ if __name__ == "__main__":
     for tid, xs in long_lived.items():
         steps = np.diff(xs)
         assert (steps > 0).all() or (steps < 0).all(), \
-            f"ID {tid} reversed direction — it was swapped onto the other cell"
+            f"ID {tid} reversed direction â€” it was swapped onto the other cell"
 
     # A motile cell swims straight over a dead one. The dead cell has not moved
     # for 30 frames, so it must not inherit the swimmer's motion: both IDs stay
