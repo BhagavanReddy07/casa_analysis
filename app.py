@@ -17,6 +17,7 @@ import pandas as pd
 import streamlit as st
 
 from casa.metrics import MAX_PLAUSIBLE_VCL
+from main import VIDEO_SUFFIXES
 from detection.detector import SpermDetector
 from detection.inference import run
 from tracking.tracker import TrackerConfig
@@ -164,7 +165,7 @@ def unprocessed_videos() -> tuple[list[Path], list[Path]]:
     """
     done = set(processed_videos())
     waiting, empty = [], []
-    for path in sorted(INPUT_DIR.glob("*.mp4")):
+    for path in sorted(p for p in INPUT_DIR.iterdir() if p.suffix.lower() in VIDEO_SUFFIXES):
         if path.stem in done:
             continue
         (empty if (OUTPUT_DIR / f"{path.stem}_tracked.mp4").exists() else waiting).append(path)
@@ -414,8 +415,14 @@ def render_table(df: pd.DataFrame) -> None:
 
 def render_upload(tracker_config: TrackerConfig) -> None:
     """Sidebar upload. Runs the same pipeline the samples went through."""
+    # WMV is accepted so footage never has to be converted before upload.
+    # A clip converted by a desktop tool arrived with its contrast crushed into
+    # 10 grey levels (against 35-63 in the reference clips), its frame rate
+    # written as 1000 fps and its colour range dropped — the detector found
+    # nothing in it. Decoding the original here avoids that whole class of
+    # damage; ffmpeg is already installed for the browser transcode.
     uploaded = st.file_uploader(f"Video file (max {MAX_UPLOAD_MB} MB)",
-                                type=["mp4", "avi", "mov"])
+                                type=["mp4", "avi", "mov", "wmv", "mkv"])
     if uploaded is None:
         return
 

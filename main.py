@@ -74,6 +74,12 @@ def parse_args() -> argparse.Namespace:
 # every clip in videos/output stays as it was until this is run.
 PIPELINE_DIRS = ("detection", "tracking", "casa", "utils")
 
+# What counts as a clip anywhere in the pipeline. WMV and MKV are here because
+# converting footage before upload is what broke a real recording: the desktop
+# converter crushed its contrast to 10 grey levels and the detector found
+# nothing. Reading the original is always safer than reading a re-encode.
+VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".wmv", ".mkv"}
+
 
 def pipeline_fingerprint() -> str:
     """Hash of the code that decides what a result looks like.
@@ -98,7 +104,7 @@ def stale_videos(input_dir: Path, output_dir: Path) -> list[Path]:
     current = pipeline_fingerprint()
     stale = []
     sources = (p for p in sorted(input_dir.iterdir())
-               if p.suffix.lower() in {".mp4", ".avi", ".mov"})
+               if p.suffix.lower() in VIDEO_SUFFIXES)
     for source in sources:
         stamp = output_dir / f"{source.stem}.build"
         csv = output_dir / f"{source.stem}_metrics.csv"
