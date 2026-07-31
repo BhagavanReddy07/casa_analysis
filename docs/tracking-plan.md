@@ -4,33 +4,10 @@ The problem, in one line: when two sperm meet, the tracker sometimes hands cell
 A's number to cell B, and when a swimming cell passes a dead one it sometimes
 steals the dead one's number.
 
-This plan fixes that in six steps. Each step says **what you do by hand** and
-**what I build**. The steps are in dependency order — step 1 makes step 4
-possible, and nothing can be judged at all until step 0 exists.
-
-Effort is my estimate of calendar time, assuming you do your part when it comes
-up.
-
----
-
-## Where we are today
-
-Already done (commits `1d3fb82` … `ef95cb3`):
-
-* the association cost now includes how far a detection sits from where the
-  track was predicted to be, not just box overlap;
-* two cells passing close are no longer collapsed into one detection, so an
-  identity stops dying at every crossing;
-* a track that has not moved refuses to be dragged along by a passer-by.
-
-Measured on 600 frames of each clip: on `38.mp4` (the crowded one) identity
-reversals went **8 → 2** and 220 fewer real cells were deleted as duplicates.
-On the other three clips it was roughly neutral.
-
-What is still broken, and why the current approach cannot fix it: **when two
-cells overlap, the detector emits one box, not two.** At that moment the
-tracker is not choosing the wrong cell out of two candidates — there is only
-one candidate. No amount of cost tuning fixes that. Steps 1 and 4 do.
+Read the results section first — it supersedes the plan below it, which was
+written before the problem was measured properly and reached different
+conclusions. The remaining steps are still the right ones; their expected
+payoff is not what the plan assumed.
 
 ---
 
