@@ -66,6 +66,27 @@ class Key:
         )
 
 
+def load_boxes(labels_dir: Path, width: int, height: int
+               ) -> dict[int, list[tuple[float, float, float, float]]]:
+    """YOLO-normalised label files -> pixel x1,y1,x2,y2 per frame index.
+
+    Frame index comes from the trailing number in the filename, so both
+    ``frame_000012.txt`` and ``s2_frame_000012.txt`` land on frame 12.
+    """
+    boxes: dict[int, list[tuple[float, float, float, float]]] = {}
+    for path in sorted(labels_dir.glob("*.txt")):
+        index = int(path.stem.split("_")[-1])
+        rows = []
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            _, cx, cy, w, h = (float(value) for value in line.split()[:5])
+            cx, cy, w, h = cx * width, cy * height, w * width, h * height
+            rows.append((cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2))
+        boxes[index] = rows
+    return boxes
+
+
 def head_in_box(gray: np.ndarray, box: tuple[float, float, float, float]
                 ) -> tuple[float, float] | None:
     """Brightest point inside a box — the sperm head under phase contrast."""

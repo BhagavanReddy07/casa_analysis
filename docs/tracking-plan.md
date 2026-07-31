@@ -112,13 +112,31 @@ Kept here so none of it is attempted again by accident.
 None of these is a cost-function problem. Two are genuine ambiguity at a
 crossing, one is an edge artefact.
 
+### Validated on a second clip
+
+A 301-frame annotation of 30.mp4 arrived after the above and was scored without
+retuning anything. The key built clean again (32 identities, zero teleports),
+and **every setting in the sweep was flat at 4 switches** — no alternative beat
+the defaults, and the defaults were best-or-equal on fragmentation and IDF1. So
+they are not overfitted to 22.mp4.
+
+| clip | frames | identity switches | what they are |
+|---|---|---|---|
+| 22.mp4 | 501 | 3 | two crossings 23-34 px apart, one cell at the frame edge |
+| 30.mp4 | 301 | 4 | one close pair (cells 6 and 9, 11-19 px apart), one last-frame artefact |
+
+Roughly one error per 150-200 frames, every one of them at genuine near-contact
+between two cells. There is no setting left to turn: the sweep is flat on both
+clips.
+
 ### Honest limits
 
-* One clip. 22.mp4 is the *least* crowded of the four; 38.mp4 has the most
-  crossings and no ground truth at all. Numbers here do not transfer to it.
-* 520 "false positives" are real sperm the annotator never boxed. They are
-  constant across settings so comparisons hold, but the absolute MOTA is
-  pessimistic.
+* Two clips, both of the calmer ones. 38.mp4 has the most crossings and no
+  ground truth at all. Numbers here do not transfer to it.
+* The "false positives" are real sperm the annotator never boxed — 520 on
+  22.mp4, and 1,385 on 30.mp4 where only about 60% of cells were labelled.
+  They are constant across settings so comparisons hold, but absolute MOTA is
+  meaningless and should not be quoted.
 * The tail of the key — 26 identities from 4,814 boxes — is only as good as
   the head extraction, which assumes the brightest pixel in a box is that
   cell's head. It has zero teleports, which is the best available check.

@@ -9,9 +9,11 @@ overlap-based match flips between two cells at exactly the crossings we are
 measuring — it reported 13 switches where head matching reports 2, and it hid
 which of them were real.
 
-The detector output is cached (``data/raw/detections.pkl``) because tracking
-settings change far more often than the model does; a sweep of twenty settings
-is seconds after the first run.
+    python -m evaluation.score --dataset sperm2 # 30.mp4 instead of 22.mp4
+
+The detector output is cached per clip because tracking settings change far
+more often than the model does; a sweep of twenty settings is seconds after the
+first run.
 """
 
 from __future__ import annotations
@@ -19,15 +21,15 @@ from __future__ import annotations
 import argparse
 import logging
 import pickle
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
+import cv2
 import motmetrics as mm
 import numpy as np
 
 from detection.detector import SpermDetector
 from evaluation import key as key_module
-from evaluation.track_eval import DETECTIONS_PATH, FRAMES_DIR, load_boxes
 from tracking.tracker import SpermTracker, TrackerConfig
 from utils.config import Config
 
@@ -35,24 +37,58 @@ logger = logging.getLogger(__name__)
 
 MATCH_GATE = 15.0     # px between a reported head and the true head
 FRAME_RATE = 49.0
-KEY_CACHE = Path("data/raw/key.pkl")
+CACHE_DIR = Path("data/raw")
 
 
-def load_key(frames: list[Path]) -> key_module.Key:
-    if KEY_CACHE.exists():
-        return pickle.loads(KEY_CACHE.read_bytes())
-    built = key_module.build(frames, load_boxes(640, 480))
-    KEY_CACHE.write_bytes(pickle.dumps(built))
+@dataclass(frozen=True)
+class Dataset:
+    """One annotated clip: where its frames, labels and caches live.
+
+    The CVAT exports land as ``<name>/<name>_frames`` and
+    ``<name>/<name>/obj_train_data``, so the layout is derived rather than
+    configured — a new clip only needs its folder dropped in.
+    """
+
+    name: str
+
+    @property
+    def frames_dir(self) -> Path:
+        return Path(self.name) / f"{self.name}_frames"
+
+    @property
+    def labels_dir(self) -> Path:
+        return Path(self.name) / self.name / "obj_train_data"
+
+    @property
+    def frames(self) -> list[Path]:
+        return sorted(self.frames_dir.glob("*.png"))
+
+    def cache(self, kind: str) -> Path:
+        return CACHE_DIR / f"{self.name}_{kind}.pkl"
+
+
+def load_key(dataset: Dataset) -> key_module.Key:
+    cached = dataset.cache("key")
+    if cached.exists():
+        return pickle.loads(cached.read_bytes())
+    frames = dataset.frames
+    height, width = cv2.imread(str(frames[0])).shape[:2]
+    built = key_module.build(frames, key_module.load_boxes(dataset.labels_dir, width, height))
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_bytes(pickle.dumps(built))
     return built
 
 
-def load_detections(frames: list[Path]) -> list[list]:
-    if DETECTIONS_PATH.exists():
-        return pickle.loads(DETECTIONS_PATH.read_bytes())
-    import cv2
+def load_detections(dataset: Dataset) -> list[list]:
+    """Detector output per frame, cached — it dwarfs everything else here."""
+    cached = dataset.cache("detections")
+    if cached.exists():
+        return pickle.loads(cached.read_bytes())
     detector = SpermDetector(Config(conf=TrackerConfig().track_low_thresh))
-    per_frame = [detector.detect(cv2.imread(str(path))) for path in frames]
-    DETECTIONS_PATH.write_bytes(pickle.dumps(per_frame))
+    per_frame = [detector.detect(cv2.imread(str(path))) for path in dataset.frames]
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_bytes(pickle.dumps(per_frame))
+    logger.info("cached detections for %d frames -> %s", len(per_frame), cached)
     return per_frame
 
 
@@ -100,9 +136,6 @@ SWEEP = {
     "motion_weight": (0.0, 0.2, 0.35, 0.5),
     "motion_gate": (10.0, 15.0, 25.0),
     "claim_distance": (0.0, 8.0, 12.0, 20.0),
-    "stationary_penalty": (0.0, 0.5, 1.0),
-    "orientation_penalty": (0.0, 0.3, 0.6, 1.0),
-    "orientation_gate": (20.0, 45.0, 90.0),
     "dedupe_distance": (0.0, 5.0, 10.0, 15.0),
     "new_track_thresh": (0.15, 0.25, 0.4),
 }
@@ -110,16 +143,17 @@ SWEEP = {
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--dataset", default="sperm1",
+                        help="annotated clip folder: sperm1 is 22.mp4, sperm2 is 30.mp4")
     parser.add_argument("--sweep", action="store_true", help="try every knob one at a time")
-    parser.add_argument("--switches", action="store_true", help="list where identity moved")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    frames = sorted(FRAMES_DIR.glob("*.png"))
-    key = load_key(frames)
-    detections = load_detections(frames)
-    logger.info("key: %d identities, %d teleports | %d frames",
-                key.identities, key.teleports(), len(frames))
+    dataset = Dataset(args.dataset)
+    key = load_key(dataset)
+    detections = load_detections(dataset)
+    logger.info("%s: %d identities, %d teleports | %d frames",
+                dataset.name, key.identities, key.teleports(), len(dataset.frames))
 
     base = TrackerConfig()
     row, accumulator = evaluate(base, key, detections)
