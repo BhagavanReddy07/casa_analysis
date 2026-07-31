@@ -60,8 +60,9 @@ class SpermDetector:
             return str(self.config.device)
         if torch.cuda.is_available():
             return f"cuda ({torch.cuda.get_device_name(0)})"
-        return f"cpu — torch {torch.__version__} has no CUDA support" \
-            if "+cpu" in torch.__version__ else "cpu (no GPU visible)"
+        if "+cpu" in torch.__version__:
+            return f"cpu (torch {torch.__version__} is the CPU-only build)"
+        return "cpu (no GPU visible)"
 
     def detect(self, frame: np.ndarray) -> list[Detection]:
         """Run the model on a single BGR frame."""

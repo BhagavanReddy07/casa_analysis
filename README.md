@@ -230,7 +230,7 @@ now names the device it actually used:
 
 ```
 classes={0: 'sperm'} device=cuda (Tesla T4)
-classes={0: 'sperm'} device=cpu — torch 2.7.0+cpu has no CUDA support
+classes={0: 'sperm'} device=cpu (torch 2.7.0+cpu is the CPU-only build)
 ```
 
 The Elastic IP survives the stop/start, so `EC2_HOST` stays valid and the next
