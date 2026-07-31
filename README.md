@@ -275,6 +275,10 @@ YOLO detection → ByteTrack → trajectories → CASA metrics → motility clas
 
 Each stage is a separate package so it can be tested and swapped on its own.
 
-Identity stability at crossings is the open problem — see
-[docs/tracking-plan.md](docs/tracking-plan.md) for the six steps that address
-it, what each one needs by hand, and the measurements behind the ordering.
+Two open threads, each with a plan and the measurements behind it:
+
+* [docs/tracking-plan.md](docs/tracking-plan.md) — identity stability at
+  crossings: what was tried, what the numbers said, and what is left.
+* [docs/retraining-plan.md](docs/retraining-plan.md) — making the model read
+  microscopes other than the VISEM rig. It finds nothing on footage from a
+  different setup, and this is the route to fixing that.
