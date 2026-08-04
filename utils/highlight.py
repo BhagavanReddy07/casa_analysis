@@ -24,8 +24,8 @@ from utils.draw import FONT, draw_count, track_color
 
 logger = logging.getLogger(__name__)
 
-MAX_CLIP_FRAMES = 400  # ~8 s at 49 fps; keeps render time and file size sane
-MAX_SUBSET_FRAMES = 900  # ~18 s; a top-N pass keeps the whole timeline
+# Keep highlight outputs close to the source video length unless a caller
+# explicitly requests a shorter clip.
 
 
 def load_trajectories(path: Path) -> dict[int, dict]:
@@ -40,7 +40,7 @@ def render_highlight(
     track_id: int,
     destination: Path,
     cfg: DrawConfig | None = None,
-    max_frames: int = MAX_CLIP_FRAMES,
+    max_frames: int | None = None,
 ) -> Path | None:
     """Write a clip showing only ``track_id``, with its path drawn behind it.
 
@@ -63,9 +63,9 @@ def render_highlight(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Trim from the middle outward if the track is long, so the clip shows
-    # the cell mid-swim rather than only its first moments.
-    if len(frames) > max_frames:
+    # Trim from the middle outward only when a caller explicitly requests a
+    # shorter clip; otherwise preserve the trajectory length.
+    if max_frames is not None and len(frames) > max_frames:
         start = (len(frames) - max_frames) // 2
         frames = frames[start:start + max_frames]
         heads = heads[start:start + max_frames]
@@ -121,7 +121,7 @@ def render_top_n(
     top_n: int,
     destination: Path,
     cfg: DrawConfig | None = None,
-    max_frames: int = MAX_SUBSET_FRAMES,
+    max_frames: int | None = None,
 ) -> Path | None:
     """Write a clip marking the best ``top_n`` cells *present in each frame*.
 
@@ -166,7 +166,11 @@ def render_top_n(
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    last_frame = min(max(per_frame), max_frames - 1)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    if max_frames is None:
+        last_frame = total_frames - 1 if total_frames > 0 else max(per_frame)
+    else:
+        last_frame = min(max(per_frame), max_frames - 1)
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(str(destination), cv2.VideoWriter_fourcc(*"mp4v"),
