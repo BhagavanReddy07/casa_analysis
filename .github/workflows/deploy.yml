@@ -38,6 +38,56 @@ jobs:
           # --delete removes files deleted from the repo, but rsync protects
           # excluded paths from deletion, so videos/ on the server is safe.
 
+      - name: Configure GPU dispatch
+        run: |
+          # The GPU box (ANALYSIS_HOST) is started and stopped by hand to
+          # control cost; app.py's upload path probes it and falls back to
+          # running on this instance when it is off — see
+          # utils/remote_analysis.py. Both pieces this needs live outside
+          # ~/sperm_CASA, so "Sync code" above never touches them: the private
+          # key, and the systemd unit's Environment= lines that point to it.
+          # Written here, on the runner, and shipped over — not built as a
+          # nested heredoc inside the ssh call below, which is a losing fight
+          # with quoting three shells deep.
+          printf '%s\n' "${{ secrets.ANALYSIS_SSH_KEY }}" > /tmp/sperm_analysis_key.pem
+          chmod 600 /tmp/sperm_analysis_key.pem
+
+          cat > /tmp/casa.service <<EOF
+          [Unit]
+          Description=Sperm CASA dashboard
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=ubuntu
+          WorkingDirectory=/home/ubuntu/sperm_CASA
+          Environment=YOLO_CONFIG_DIR=/home/ubuntu/.config/Ultralytics
+          Environment=ANALYSIS_HOST=${{ secrets.ANALYSIS_HOST }}
+          Environment=ANALYSIS_USER=ubuntu
+          Environment=ANALYSIS_KEY_PATH=/home/ubuntu/.ssh/sperm_analysis_key.pem
+          Environment=ANALYSIS_APP_DIR=/home/ubuntu/sperm_CASA
+          ExecStart=/home/ubuntu/sperm_CASA/.venv/bin/streamlit run app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          scp -i ~/.ssh/deploy.pem -o StrictHostKeyChecking=yes \
+            /tmp/sperm_analysis_key.pem /tmp/casa.service \
+            "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/"
+
+          ssh -i ~/.ssh/deploy.pem -o StrictHostKeyChecking=yes \
+            "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" '
+              set -e
+              mkdir -p ~/.ssh && chmod 700 ~/.ssh
+              mv /tmp/sperm_analysis_key.pem ~/.ssh/sperm_analysis_key.pem
+              chmod 600 ~/.ssh/sperm_analysis_key.pem
+              sudo mv /tmp/casa.service /etc/systemd/system/casa.service
+              sudo systemctl daemon-reload
+            '
+
       - name: Install dependencies and restart
         run: |
           ssh -i ~/.ssh/deploy.pem "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" '
