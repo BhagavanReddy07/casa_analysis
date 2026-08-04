@@ -17,6 +17,7 @@ from casa.motility import MotilityThresholds
 from detection.detector import SpermDetector
 from detection.inference import run
 from tracking.tracker import TrackerConfig
+from utils import remote_analysis
 from utils.config import MICRONS_PER_PIXEL, Config
 from utils.helpers import setup_logging
 
@@ -167,14 +168,37 @@ def main() -> None:
     else:
         sources = [args.source]
 
+    # --rebuild runs on the always-on frontend by design — it is dispatched
+    # from the deploy pipeline, which has no GPU. Checked once, not per clip:
+    # the GPU box does not come and go within the few minutes a batch takes,
+    # and one probe instead of N is one fewer way to be unlucky on a flaky
+    # connection.
+    use_remote = args.rebuild and remote_analysis.available()
+    if args.rebuild:
+        logger.info("GPU box %s for this batch", "available — dispatching there" if use_remote
+                    else "not reachable — running on this machine")
+
     for source in sources:
-        destination = run(detector, str(source), config, show=args.show,
-                          max_frames=args.max_frames, track=args.track or args.rebuild,
-                          tracker_config=tracker_config, metrics=args.metrics or args.rebuild,
-                          microns_per_pixel=args.um_per_px, motility_thresholds=thresholds)
+        remote_ok = False
+        if use_remote:
+            remote_ok = remote_analysis.run_remote(
+                Path(source), tracker_config.min_track_length, output_dir=args.output)
+            if not remote_ok:
+                logger.warning("%s: GPU run failed, falling back to local", Path(source).stem)
+
+        if remote_ok:
+            destination = args.output / f"{Path(source).stem}_tracked.mp4"
+        else:
+            destination = run(detector, str(source), config, show=args.show,
+                              max_frames=args.max_frames, track=args.track or args.rebuild,
+                              tracker_config=tracker_config, metrics=args.metrics or args.rebuild,
+                              microns_per_pixel=args.um_per_px, motility_thresholds=thresholds)
         if args.rebuild:
             # Written last, so an interrupted rebuild leaves the clip stale and
-            # the next deploy picks it up again.
+            # the next deploy picks it up again. The fingerprint describes
+            # *this* machine's code — correct either way, since a remote run
+            # only happens once the GPU box has been confirmed to match (see
+            # the deploy pipeline's "Sync code to the GPU box" step).
             (args.output / f"{Path(source).stem}.build").write_text(pipeline_fingerprint())
         logger.info("output written to %s", destination)
 

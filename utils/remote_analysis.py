@@ -77,7 +77,7 @@ def _scp(source: str, destination: str, timeout: float) -> subprocess.CompletedP
         capture_output=True, timeout=timeout)
 
 
-def run_remote(source: Path, min_track_length: int) -> bool:
+def run_remote(source: Path, min_track_length: int, output_dir: Path = Path("videos/output")) -> bool:
     """Upload, analyse on the GPU box, and pull the results back.
 
     Only ``min_track_length`` is forwarded — it is the one tracking setting
@@ -112,9 +112,10 @@ def run_remote(source: Path, min_track_length: int) -> bool:
 
         stem = source.stem
         tracked_video_ok = False
+        output_dir.mkdir(parents=True, exist_ok=True)
         for suffix in _OUTPUT_SUFFIXES:
             remote_path = f"{APP_DIR}/videos/output/{stem}{suffix}"
-            local_path = Path("videos/output") / f"{stem}{suffix}"
+            local_path = output_dir / f"{stem}{suffix}"
             result = _scp(f"{USER}@{HOST}:{remote_path}", str(local_path), timeout=60)
             if suffix == "_tracked.mp4":
                 tracked_video_ok = result.returncode == 0

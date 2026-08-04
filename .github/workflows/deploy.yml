@@ -88,6 +88,44 @@ jobs:
               sudo systemctl daemon-reload
             '
 
+      - name: Sync code to the GPU box
+        run: |
+          # This runner cannot reach ANALYSIS_HOST directly — it is a private
+          # IP, only reachable from inside the VPC. So the transfer happens
+          # FROM the frontend, which "Sync code" above just gave a fresh
+          # checkout, TO the analysis box over its private IP: one hop within
+          # the VPC instead of a second upload from here over the internet.
+          #
+          # Best-effort. The box is started and stopped by hand to save cost,
+          # so "unreachable during a deploy" is the common case, not a fault —
+          # a deploy must not fail just because nobody happened to have it on.
+          # The cost of that: code there is only as fresh as the last deploy
+          # that caught it powered on. Before this step existed, that gap was
+          # total and permanent — a one-time manual copy that silently drifted
+          # further out of date with every push after it, so main.py --rebuild
+          # and utils/remote_analysis.py were dispatching real analysis to a
+          # box quietly running old tracking logic. Best-effort-but-usually-on
+          # beats always-stale.
+          ssh -i ~/.ssh/deploy.pem -o StrictHostKeyChecking=yes \
+            "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" '
+              if ! ssh -i ~/.ssh/sperm_analysis_key.pem -o BatchMode=yes \
+                   -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+                   ubuntu@${{ secrets.ANALYSIS_HOST }} true 2>/dev/null; then
+                echo "GPU box unreachable - skipping, it will run stale code until a deploy catches it on"
+                exit 0
+              fi
+              cd ~/sperm_CASA
+              tar czf - \
+                --exclude=".git" --exclude=".github" --exclude="videos" \
+                --exclude=".venv" --exclude="__pycache__" --exclude="sperm_pose_baseline" \
+                . | ssh -i ~/.ssh/sperm_analysis_key.pem -o StrictHostKeyChecking=accept-new \
+                  ubuntu@${{ secrets.ANALYSIS_HOST }} "mkdir -p ~/sperm_CASA && tar xzf - -C ~/sperm_CASA"
+              ssh -i ~/.ssh/sperm_analysis_key.pem -o StrictHostKeyChecking=accept-new \
+                ubuntu@${{ secrets.ANALYSIS_HOST }} \
+                "cd ~/sperm_CASA && .venv/bin/pip install -q -r requirements.txt"
+              echo "GPU box code synced"
+          '
+
       - name: Install dependencies and restart
         run: |
           ssh -i ~/.ssh/deploy.pem "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" '

@@ -605,7 +605,8 @@ def render_upload(tracker_config: TrackerConfig) -> None:
     used_remote = False
     if remote_analysis.available():
         with st.spinner("Analysing on the GPU box… the page stays frozen until this finishes."):
-            used_remote = remote_analysis.run_remote(destination, tracker_config.min_track_length)
+            used_remote = remote_analysis.run_remote(destination, tracker_config.min_track_length,
+                                                     output_dir=OUTPUT_DIR)
         if not used_remote:
             st.warning("The GPU box didn't finish the run — analysing locally instead. "
                       "This is slower; try again later if you want the GPU box to pick it up.")
