@@ -27,6 +27,7 @@ from utils.explain import (GRADE_HELP, GRADE_LABEL, METRIC_HELP, WHO_DISCLAIMER,
                            WHO_REFERENCE)
 from utils.helpers import setup_logging
 from utils.highlight import load_trajectories, render_highlight
+from utils import remote_analysis
 from utils.video import ensure_browser_playable
 
 INPUT_DIR = Path("videos/input")
@@ -208,7 +209,7 @@ def render_dashboard(df: pd.DataFrame, paths: dict[str, Path], stem: str) -> Non
                           delta=f"{n} cells", delta_color="off", help=GRADE_HELP[grade])
             st.markdown("</div>", unsafe_allow_html=True)
 
-    st.altair_chart(charts.motility_bar(df), use_container_width=True)
+    st.altair_chart(charts.motility_bar(df), width='stretch')
 
     # WHO orientation
     prog_limit, prog_note = WHO_REFERENCE["progressive_pct"]
@@ -242,24 +243,24 @@ def render_dashboard(df: pd.DataFrame, paths: dict[str, Path], stem: str) -> Non
         st.markdown("#### Speed vs. straightness")
         st.caption("Each dot is one cell. Fast and straight sits top-right; "
                    "fast but circling sits bottom-right. Hover for details.")
-        st.altair_chart(charts.velocity_scatter(df), use_container_width=True)
+        st.altair_chart(charts.velocity_scatter(df), width='stretch')
     with right:
         st.markdown("#### Speed distribution")
         st.caption("How the sample spreads across velocities.")
-        st.altair_chart(charts.velocity_histogram(df), use_container_width=True)
+        st.altair_chart(charts.velocity_histogram(df), width='stretch')
 
     st.markdown("#### Downloads")
     cols = st.columns(3)
     cols[0].download_button("Metrics CSV", paths["csv"].read_bytes(),
                             file_name=paths["csv"].name, mime="text/csv",
-                            use_container_width=True)
+                            width='stretch')
     cols[1].download_button("Tracked video", paths["tracked"].read_bytes(),
                             file_name=paths["tracked"].name, mime="video/mp4",
-                            use_container_width=True)
+                            width='stretch')
     if paths["trajectories"].exists():
         cols[2].download_button("Trajectories JSON", paths["trajectories"].read_bytes(),
                                 file_name=paths["trajectories"].name,
-                                mime="application/json", use_container_width=True)
+                                mime="application/json", width='stretch')
 
 
 ALL_CELLS = "All cells"
@@ -382,7 +383,7 @@ def _render_cell_detail(df: pd.DataFrame, paths: dict[str, Path], track_id) -> N
     if trajectory is not None:
         with st.expander("Path travelled", expanded=True):
             st.altair_chart(charts.trajectory_chart(trajectory["head"]),
-                            use_container_width=True)
+                            width='stretch')
 
 
 def render_table(df: pd.DataFrame) -> None:
@@ -404,13 +405,51 @@ def render_table(df: pd.DataFrame) -> None:
         display["Grade"] = display["Grade"].map(GRADE_LABEL).fillna(display["Grade"])
 
     st.dataframe(
-        display, use_container_width=True, hide_index=True,
+        display, width='stretch', hide_index=True,
         column_config={c: st.column_config.NumberColumn(format="%.2f")
                        for c in display.columns
                        if display[c].dtype.kind == "f"},
     )
     st.caption(f"{len(view)} of {len(df)} cells shown. "
                "`Reliable = false` marks tracks rejected as measurement artifacts.")
+
+
+# Everything a finished run writes for one clip. Listed rather than globbed on
+# the stem: a glob for "22_*" also matches a sample called "22_repeat", and
+# deleting someone else's results is not a mistake worth risking to save a line.
+RESULT_SUFFIXES = ("_metrics.csv", "_tracked.mp4", "_tracked.h264.mp4",
+                   "_annotated.mp4", "_trajectories.json", ".build")
+
+
+def result_files(stem: str) -> list[Path]:
+    """Every output file belonging to one sample, whichever of them exist."""
+    files = [OUTPUT_DIR / f"{stem}{suffix}" for suffix in RESULT_SUFFIXES]
+    return [p for p in files if p.exists()] + sorted(HIGHLIGHT_DIR.glob(f"{stem}_id*.mp4"))
+
+
+def render_delete(stem: str, source: Path) -> None:
+    """Remove one sample's results, to re-run a clip or clear out a test.
+
+    Results only by default. The source video stays in ``videos/input`` and the
+    clip reappears under "Not yet analysed", which is what you want when
+    re-running it after a settings change — deleting the footage to change a
+    threshold would be a surprising thing for a delete button to do. Tick the
+    box to remove the video as well.
+    """
+    with st.expander(f"Delete results for {stem}"):
+        drop_source = st.checkbox("Also delete the video itself", key=f"drop_{stem}",
+                                  help="Removes it from videos/input too, so it will not "
+                                       "reappear as an unanalysed clip.")
+        targets = result_files(stem) + ([source] if drop_source else [])
+        if not targets:
+            st.caption("Nothing to delete.")
+            return
+        st.caption(f"{len(targets)} file(s): " + ", ".join(p.name for p in targets))
+        if st.button("Delete", key=f"delete_{stem}", width='stretch'):
+            for path in targets:
+                path.unlink(missing_ok=True)
+            load_metrics.clear()
+            st.rerun()
 
 
 def render_upload(tracker_config: TrackerConfig) -> None:
@@ -432,28 +471,41 @@ def render_upload(tracker_config: TrackerConfig) -> None:
         return
 
     st.caption(f"**{uploaded.name}** · {size_mb:.1f} MB")
-    if not st.button("Run analysis", type="primary", use_container_width=True):
+    if not st.button("Run analysis", type="primary", width='stretch'):
         st.caption("The page is frozen while this runs and the tab must stay "
-                   "open. On the GPU a 30-second clip takes about half a "
-                   "minute; long recordings take proportionally longer.")
+                   "open. Roughly half a minute for a 30-second clip on the "
+                   "GPU box when it's on; several minutes on this server's "
+                   "own CPU when it's not.")
         return
 
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     destination = INPUT_DIR / uploaded.name
     destination.write_bytes(uploaded.getbuffer())
 
-    config = Config(conf=tracker_config.track_low_thresh, output_dir=OUTPUT_DIR)
-    config.draw.show_conf = False
-    config.draw.trail_length = 0
+    # The GPU box is started and stopped by hand to control cost, so it is
+    # routinely off — that is normal operation, not a fault. available() is a
+    # cheap TCP probe, so checking it costs nothing when it is down.
+    used_remote = False
+    if remote_analysis.available():
+        with st.spinner("Analysing on the GPU box… the page stays frozen until this finishes."):
+            used_remote = remote_analysis.run_remote(destination, tracker_config.min_track_length)
+        if not used_remote:
+            st.warning("The GPU box didn't finish the run — analysing locally instead. "
+                      "This is slower; try again later if you want the GPU box to pick it up.")
 
-    with st.spinner("Analysing… the page stays frozen until this finishes."):
-        try:
-            detector = SpermDetector(config)
-            run(detector, str(destination), config, track=True, metrics=True,
-                tracker_config=tracker_config, microns_per_pixel=MICRONS_PER_PIXEL)
-        except Exception as exc:  # surface the failure instead of a blank page
-            st.error(f"Analysis failed: {exc}")
-            return
+    if not used_remote:
+        config = Config(conf=tracker_config.track_low_thresh, output_dir=OUTPUT_DIR)
+        config.draw.show_conf = False
+        config.draw.trail_length = 0
+
+        with st.spinner("Analysing locally… the page stays frozen until this finishes."):
+            try:
+                detector = SpermDetector(config)
+                run(detector, str(destination), config, track=True, metrics=True,
+                    tracker_config=tracker_config, microns_per_pixel=MICRONS_PER_PIXEL)
+            except Exception as exc:  # surface the failure instead of a blank page
+                st.error(f"Analysis failed: {exc}")
+                return
 
     # A finished run is not the same as a usable one. When the detector finds
     # nothing — footage at a different magnification, say — there are no
@@ -473,7 +525,8 @@ def render_upload(tracker_config: TrackerConfig) -> None:
         return
 
     load_metrics.clear()
-    st.success(f"Done — **{destination.stem}** is now in the sample list.")
+    where = "the GPU box" if used_remote else "this server"
+    st.success(f"Done (on {where}) — **{destination.stem}** is now in the sample list.")
     st.rerun()
 
 
@@ -496,6 +549,7 @@ def main() -> None:
 
         if videos:
             stem = st.selectbox("Sample", sorted(videos))
+            render_delete(stem, videos[stem]["source"])
         else:
             stem = None
             st.info("No analysed videos yet — upload one below.")

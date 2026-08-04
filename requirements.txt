@@ -4,6 +4,11 @@
 # silent minor-version bump would break tracking or change results without
 # any test noticing.
 ultralytics==8.3.124
+lap>=0.5.12             # BYTETracker's Hungarian assignment step imports this
+                        # lazily; ultralytics does not declare it, so it is
+                        # only present on an install if something else pulled
+                        # it in first. Absent, tracking fails at first use with
+                        # ModuleNotFoundError, detection-only mode is unaffected.
 opencv-python>=4.10,<5      # cv2 5.x is a major bump; not validated here
 numpy>=1.26,<3
 scipy>=1.13

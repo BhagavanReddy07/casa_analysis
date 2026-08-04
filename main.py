@@ -40,16 +40,24 @@ def parse_args() -> argparse.Namespace:
                         help="overlay per-cell confidence (off by default — clutters a clinical view)")
     parser.add_argument("--verbose", action="store_true")
 
+    # Defaults come from TrackerConfig itself rather than being retyped here —
+    # a second hardcoded copy is exactly how this drifted before: match_thresh
+    # was tuned 0.95 -> 0.99 in TrackerConfig, this parser kept defaulting to
+    # 0.95, and because argparse always supplies *some* value, every run of
+    # `main.py --track` without an explicit --match-thresh silently rebuilt
+    # every video on the stale setting — including, at the time this was
+    # caught, every clip in videos/output.
+    _defaults = TrackerConfig()
     group = parser.add_argument_group("tracking")
     group.add_argument("--track", action="store_true", help="assign persistent IDs")
-    group.add_argument("--track-buffer", type=int, default=30,
+    group.add_argument("--track-buffer", type=int, default=_defaults.track_buffer,
                        help="frames a lost cell keeps its identity, scaled by fps/30")
-    group.add_argument("--match-thresh", type=float, default=0.95,
+    group.add_argument("--match-thresh", type=float, default=_defaults.match_thresh,
                        help="association leniency, 1-IoU distance (higher = more lenient; "
-                            "0.8 fragments IDs on our small sperm boxes, see tracker.py)")
+                            "see tracker.py for how this was tuned)")
     group.add_argument("--trail", type=int, default=0,
                        help="frames of path drawn behind each cell (0 = off, dense fields get unreadable with it on)")
-    group.add_argument("--min-track-len", type=int, default=10,
+    group.add_argument("--min-track-len", type=int, default=_defaults.min_track_length,
                        help="frames a track needs to count as usable")
 
     metrics_group = parser.add_argument_group("CASA metrics")
