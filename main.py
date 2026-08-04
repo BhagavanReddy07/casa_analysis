@@ -78,10 +78,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# Directories whose .py files change what a result looks like. The dashboard
-# only reads finished files, so nothing else notices that a fix has landed and
-# every clip in videos/output stays as it was until this is run.
-PIPELINE_DIRS = ("detection", "tracking", "casa", "utils")
+# Files whose changes actually affect the detection/tracking/CASA outputs.
+# UI/frontend changes, docs, or other viewer-only code should not invalidate
+# the rebuild stamp and force every clip to be reprocessed.
+REBUILD_FILES = (
+    Path("detection/detector.py"),
+    Path("detection/inference.py"),
+    Path("tracking/tracker.py"),
+    Path("tracking/trajectory.py"),
+    Path("casa/metrics.py"),
+    Path("casa/motility.py"),
+    Path("utils/config.py"),
+)
 
 # What counts as a clip anywhere in the pipeline. WMV and MKV are here because
 # converting footage before upload is what broke a real recording: the desktop
@@ -91,16 +99,21 @@ VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".wmv", ".mkv"}
 
 
 def pipeline_fingerprint() -> str:
-    """Hash of the code that decides what a result looks like.
+    """Hash of the code and model weights that decide what a result looks like.
 
     Content, not mtime: a deploy checks the repo out fresh, so every file's
     mtime is "now" on the server and a timestamp comparison would re-analyse
-    every clip on every push, including README-only ones.
+    every clip on every push, including README-only ones. Model changes must
+    also invalidate the rebuild stamp so old videos are reprocessed with the
+    new checkpoint.
     """
     digest = hashlib.sha256()
-    for directory in PIPELINE_DIRS:
-        for path in sorted(Path(directory).glob("*.py")):
+    for path in REBUILD_FILES:
+        if path.exists():
             digest.update(path.read_bytes())
+    for path in sorted(Path("models").glob("*.pt")):
+        digest.update(path.name.encode())
+        digest.update(path.read_bytes())
     return digest.hexdigest()[:12]
 
 
