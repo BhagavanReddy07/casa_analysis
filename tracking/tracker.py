@@ -27,7 +27,8 @@ from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
 
 import numpy as np
-from ultralytics.trackers.byte_tracker import BYTETracker
+from ultralytics.trackers.basetrack import TrackState
+from ultralytics.trackers.byte_tracker import BYTETracker, STrack
 
 from detection.detector import Detection
 
@@ -58,18 +59,23 @@ class TrackerConfig:
     on 38.mp4) can be a large fraction of the box width and drop IoU below
     what 0.8 accepts. That killed and respawned a continuously-detected,
     never-lost cell under three different IDs in 30 frames (25 -> 54 -> 60).
-    Sweeping 0.8-1.0 on all four clips: 0.95-0.99 plateau at the same, much
-    lower track count with low mean_gaps (real fix); 1.0 removes the
-    threshold's filtering entirely and mean_gaps triples, i.e. it starts
-    accepting bad matches and can splice two different cells into one
-    trajectory. 0.95 is the highest value that still rejects those.
+    Against VISEM ground truth 0.99 beats 0.95 on switches *and* IDF1 on every
+    clip; 0.8 and 0.9 are both worse than either. 1.0 is not offered: it
+    removes the threshold's filtering entirely and starts splicing two cells
+    into one trajectory.
+
+    These values were re-derived against :mod:`evaluation.visem` after the
+    original tuning was found to have been fitted to a key our own tracker had
+    prefilled. That key measured clip 38 at 2 switches per 300 frames and
+    called it the best-handled clip; the independent annotation measures 22 per
+    1470, making it the worst. See ``docs/tracking-plan.md``.
     """
 
     track_high_thresh: float = 0.25   # first association
     track_low_thresh: float = 0.10    # second association (the "BYTE" pass)
     new_track_thresh: float = 0.25    # confidence needed to start an identity
     track_buffer: int = 30
-    match_thresh: float = 0.95
+    match_thresh: float = 0.99
     fuse_score: bool = True
 
     # px between head keypoints. Raised from 10 after measuring what a viewer
@@ -92,27 +98,87 @@ class TrackerConfig:
     # fix. Calibration knob: raise motion_weight if IDs still swap at
     # crossings, lower it if fast cells fragment.
     #
-    # Chosen on the union of the three annotated clips, not on one of them
-    # (python -m evaluation.score --dataset spermN --sweep). Across 22, 30 and
-    # 38.mp4 a weight of 0.5 gives 9 identity switches against 10 at 0.35, with
-    # the same number of missed cells and one fewer fragmentation. Dropping the
-    # term entirely costs 2 more switches on 22.mp4.
+    # Chosen on the union of VISEM 22, 30 and 38 (4,410 annotated frames), with
+    # VISEM 60 held out of the fit entirely as the overfitting check:
     #
-    # The gate matters more than the weight: 10 px costs a switch on 38.mp4 and
-    # 25 px costs IDF1 on every clip, so it stays near one box width.
-    motion_weight: float = 0.5
-    motion_gate: float = 15.0         # px, ~one box width
+    #     python -m evaluation.score --visem 22 --sweep
+    #
+    # Raising the weight 0.5 -> 0.7 and the gate 15 -> 25 px together with
+    # match_thresh takes the fit set from 40 switches to 31 (-22%) while IDF1
+    # rises 0.8930 -> 0.9031, and the holdout improves too (5 -> 4 switches,
+    # IDF1 0.7887 -> 0.7941). Both directions were previously tuned the other
+    # way against the biased key, which reported that 25 px "costs IDF1 on
+    # every clip" — it does the opposite.
+    #
+    # What the holdout rejected: track_buffer=10 scored best of anything on the
+    # fit set (28 switches) and nearly doubled the holdout's (4 -> 9). It is not
+    # a real improvement, and it is why 60 is kept out of the sweep.
+    motion_weight: float = 0.7
+    motion_gate: float = 25.0
 
     # A detection this close to a live track's last head continues that
     # identity. Measured frame-to-frame head displacement is ~11 px on 38.mp4.
     claim_distance: float = 12.0
 
+    # Longest gap (frames) that Observation-Centric Re-Update will replay.
+    # See :class:`_ORUSTrack`.
+    #
+    # OFF, because it was measured and it does not pay here. It fires (22 times
+    # on VISEM 22, gaps of 2-13 frames) and costs 2 switches and 0.006 IDF1
+    # across the fit set. The reason is visible in the data: these clips lose a
+    # track for a mean of 0.9 frames, so there is almost no accumulated drift
+    # for the rewind to repair, and what it does change is sub-pixel against a
+    # 25 px gate.
+    #
+    # Kept rather than deleted because the regime it targets is real — the
+    # dense clip loses tracks for a mean of 6.8 frames — and there is no ground
+    # truth for that clip yet. Re-test it there before deleting or enabling.
+    oru_max_gap: int = 0
+
+    # Re-acquiring a cell after an occlusion. A track that lost its detections
+    # is scored, on the frame it comes back, against a prediction extrapolated
+    # from its own observed history instead of its coasting Kalman state.
+    #
+    # ``history_lag`` is the whole point. Two cells that are about to merge do
+    # not merge cleanly: the detector's boxes blend first, so the last
+    # observations before a track goes lost are already pulled toward its
+    # neighbour. Traced on the 4/32 crossing in 22.mp4, where a motile cell
+    # passes an immotile one: extrapolating from the final frame before the
+    # merge puts *both* tracks on the moving cell and they come out swapped,
+    # while backing off puts the immotile track 1.8 px from its own cell and
+    # 17.4 px from the wrong one. That crossing is fixed — switches on 22 go
+    # 8 -> 5 and its frame-1005 double switch disappears.
+    #
+    # The physical argument says back off 2-3 frames; the measurement says 8,
+    # on VISEM 22/30/38 with 60 held out (25 switches against 31, mean IDF1
+    # 0.9031 -> 0.9393, holdout unchanged). Part of that is likely that a long
+    # lag also means short tracks have no clean window and quietly fall back to
+    # the Kalman prediction, i.e. the rule fires less often as well as better.
+    # Its neighbours (lag 8 at window 5 and 15) score 31 and 27, so it is not a
+    # lone spike, but the sweep is noisy — 15 settings ranged 25-34 on ~30
+    # events, and swings of two or three are not real. IDF1 is the sounder
+    # signal here and improves at almost every setting.
+    #
+    # ``history_window`` is how many frames the velocity is fitted over. Long
+    # enough to average out the 0.4 px/frame jitter that made per-frame heading
+    # useless; short enough that a turning cell still extrapolates straight.
+    #
+    # Set ``history_window`` to 0 to fall back to the Kalman prediction.
+    history_lag: int = 8
+    history_window: int = 10
+
 # Keys BYTETracker reads off its args namespace; the rest are ours.
 _BYTETRACK_KEYS = (
     "track_high_thresh", "track_low_thresh", "new_track_thresh",
     "track_buffer", "match_thresh", "fuse_score",
-    "motion_weight", "motion_gate",
+    "motion_weight", "motion_gate", "oru_max_gap",
+    "history_lag", "history_window",
 )
+
+# Frames of observed positions kept per track. Only the newest
+# ``history_window + history_lag`` are ever read; the rest is slack so those
+# two can be swept without silently running out of history.
+_HISTORY_CAP = 40
 
 
 class _DetectionBoxes:
@@ -128,6 +194,96 @@ class _DetectionBoxes:
         self.xywh = np.stack([(x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1], axis=1)
         self.conf = np.array([d.confidence for d in detections], dtype=np.float32)
         self.cls = np.zeros(len(detections), dtype=np.float32)
+
+
+class _ORUSTrack(STrack):
+    """STrack with OC-SORT's Observation-Centric Re-Update.
+
+    A track that loses its detections is still predicted forward every frame,
+    but never corrected, so its Kalman state drifts and its covariance grows.
+    Stock ``re_activate`` then folds the recovered detection into *that* drifted
+    state with a single update. Measured on the VISEM clips, cells go dark for a
+    mean of 6.8 frames in a crowded field against 0.9 in a sparse one, so the
+    state a re-acquisition lands on is far worse exactly where identities are
+    hardest to keep.
+
+    ORU repairs it: rewind to the state the track held when it was last
+    *observed*, then replay the filter over a straight line of virtual
+    observations between that point and the recovered one::
+
+        z_t = z_t1 + (t - t1) / (t2 - t1) * (z_t2 - z_t1)
+
+    The filter arrives at the new detection having been corrected at every
+    intermediate frame, so the accumulated prediction error is gone rather than
+    baked in. This is the component OC-SORT's own ablation reports as its
+    largest contributor.
+
+    ponytail: straight-line interpolation, which is what the paper specifies.
+    Sperm swim in arcs, so a curved fit would be closer to the truth — worth it
+    only if ``oru_max_gap`` ever needs to run long.
+    """
+
+    _oru_max_gap = 0
+
+    def __init__(self, xywh, score, cls):
+        super().__init__(xywh, score, cls)
+        self._anchor: tuple[np.ndarray, np.ndarray] | None = None
+        self._last_obs: np.ndarray | None = None
+        # Where this cell has actually been seen, as (frame, centre). The
+        # Kalman state is a belief; this is the record, and after an occlusion
+        # the record is the more trustworthy of the two.
+        self._history: list[tuple[int, np.ndarray]] = []
+
+    def _remember(self, observation: np.ndarray, frame_id: int) -> None:
+        """Pin the state to rewind to, the line's start, and the observation."""
+        self._last_obs = observation
+        self._anchor = (self.mean.copy(), self.covariance.copy())
+        self._history.append((frame_id, np.array(observation[:2], dtype=np.float64)))
+        del self._history[:-_HISTORY_CAP]
+
+    def history_prediction(self, frame_id: int, lag: int, window: int) -> np.ndarray | None:
+        """Where this cell should be now, extrapolated from what was *seen*.
+
+        The velocity is fitted over ``window`` frames ending ``lag`` frames
+        before the last observation, so the frames in which the detector was
+        already blending this cell with the one it collided into take no part
+        in the estimate. Returns ``None`` when there is too little clean
+        history, and the caller then falls back to the Kalman prediction.
+        """
+        if window <= 0 or len(self._history) < 2:
+            return None
+        cutoff = self._history[-1][0] - lag
+        usable = [entry for entry in self._history if entry[0] <= cutoff][-window:]
+        if len(usable) < 2 or usable[-1][0] == usable[0][0]:
+            return None
+        (first_frame, first), (last_frame, last) = usable[0], usable[-1]
+        velocity = (last - first) / (last_frame - first_frame)
+        return last + velocity * (frame_id - last_frame)
+
+    def activate(self, kalman_filter, frame_id):
+        super().activate(kalman_filter, frame_id)
+        self._remember(self.convert_coords(self._tlwh), frame_id)
+
+    def update(self, new_track, frame_id):
+        super().update(new_track, frame_id)
+        self._remember(self.convert_coords(new_track.tlwh), frame_id)
+
+    def re_activate(self, new_track, frame_id, new_id=False):
+        gap = frame_id - self.frame_id
+        observation = self.convert_coords(new_track.tlwh)
+        if self._anchor is not None and 1 < gap <= self._oru_max_gap:
+            mean, covariance = self._anchor
+            self.mean, self.covariance = mean.copy(), covariance.copy()
+            for step in range(1, gap):
+                virtual = self._last_obs + (step / gap) * (observation - self._last_obs)
+                self.mean, self.covariance = self.kalman_filter.predict(self.mean, self.covariance)
+                self.mean, self.covariance = self.kalman_filter.update(
+                    self.mean, self.covariance, virtual)
+            # One more predict, so super() updates from the current frame's
+            # prediction exactly as it would have on an unbroken track.
+            self.mean, self.covariance = self.kalman_filter.predict(self.mean, self.covariance)
+        super().re_activate(new_track, frame_id, new_id)
+        self._remember(observation, frame_id)
 
 
 class _MotionBYTETracker(BYTETracker):
@@ -155,11 +311,32 @@ class _MotionBYTETracker(BYTETracker):
       identities are ever matched across a gap rather than frame to frame.
     """
 
+    def init_track(self, dets, scores, cls, img=None):
+        tracks = [_ORUSTrack(xyxy, s, c) for (xyxy, s, c) in zip(dets, scores, cls)]
+        for track in tracks:
+            track._oru_max_gap = self.args.oru_max_gap
+        return tracks
+
+    def _expected_centre(self, track):
+        """Where the motion term should expect this track to be.
+
+        A *tracked* cell was observed last frame, so its Kalman prediction is
+        as good as anything. A *lost* one has been coasting on a state whose
+        final corrections came from the very frames where the detector was
+        merging it with its neighbour — the crossing that lost it in the first
+        place. Its own earlier history is cleaner, so that is used instead.
+        """
+        if track.state == TrackState.Tracked:
+            return track.xywh[:2]
+        predicted = track.history_prediction(
+            self.frame_id, self.args.history_lag, self.args.history_window)
+        return track.xywh[:2] if predicted is None else predicted
+
     def get_dists(self, tracks, detections):
         dists = super().get_dists(tracks, detections)
         if not len(tracks) or not len(detections):
             return dists
-        pred = np.array([t.xywh[:2] for t in tracks], dtype=np.float32)
+        pred = np.array([self._expected_centre(t) for t in tracks], dtype=np.float32)
         obs = np.array([d.xywh[:2] for d in detections], dtype=np.float32)
         gap = np.linalg.norm(pred[:, None, :] - obs[None, :, :], axis=2)
         motion = np.minimum(gap / self.args.motion_gate, 1.0)

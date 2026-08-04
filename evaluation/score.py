@@ -30,6 +30,7 @@ import numpy as np
 
 from detection.detector import SpermDetector
 from evaluation import key as key_module
+from evaluation import visem
 from tracking.tracker import SpermTracker, TrackerConfig
 from utils.config import Config
 
@@ -109,6 +110,26 @@ def load_detections(dataset: Dataset) -> list[list]:
     return per_frame
 
 
+def load_video_detections(video_id: str) -> list[list]:
+    """Same, straight off the mp4 — the VISEM clips have no exported frames."""
+    cached = CACHE_DIR / f"visem{video_id}_detections.pkl"
+    if cached.exists():
+        return pickle.loads(cached.read_bytes())
+    detector = SpermDetector(Config(conf=TrackerConfig().track_low_thresh))
+    capture = cv2.VideoCapture(visem.VIDEOS[video_id])
+    per_frame = []
+    while True:
+        ok, frame = capture.read()
+        if not ok:
+            break
+        per_frame.append(detector.detect(frame))
+    capture.release()
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_bytes(pickle.dumps(per_frame))
+    logger.info("cached detections for %d frames -> %s", len(per_frame), cached)
+    return per_frame
+
+
 def evaluate(config: TrackerConfig, key: key_module.Key, detections: list[list]):
     """Run the tracker over cached detections and accumulate MOT metrics."""
     tracker = SpermTracker(config, frame_rate=FRAME_RATE)
@@ -162,15 +183,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dataset", default="sperm1",
                         help="annotated clip folder: sperm1 is 22.mp4, sperm2 is 30.mp4")
+    parser.add_argument("--visem", choices=sorted(visem.VIDEOS),
+                        help="score against VISEM ground truth instead — all 1470 "
+                             "frames, expert identities, no bias from our own tracker")
     parser.add_argument("--sweep", action="store_true", help="try every knob one at a time")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    dataset = Dataset(args.dataset)
-    key = load_key(dataset)
-    detections = load_detections(dataset)
+    if args.visem:
+        key, detections = visem.load(args.visem), load_video_detections(args.visem)
+        label = f"visem{args.visem}"
+    else:
+        dataset = Dataset(args.dataset)
+        key, detections = load_key(dataset), load_detections(dataset)
+        label = dataset.name
     logger.info("%s: %d identities, %d teleports | %d frames",
-                dataset.name, key.identities, key.teleports(), len(dataset.frames))
+                label, key.identities, key.teleports(), len(detections))
 
     base = TrackerConfig()
     row, accumulator = evaluate(base, key, detections)

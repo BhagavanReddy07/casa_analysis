@@ -9,6 +9,187 @@ written before the problem was measured properly and reached different
 conclusions. The remaining steps are still the right ones; their expected
 payoff is not what the plan assumed.
 
+**Superseded again on 2026-08-03** by the section immediately below: the clips
+turned out to be public VISEM-Tracking videos with expert identities already
+published, and several conclusions on this page do not survive that key.
+
+---
+
+## The clips are VISEM-Tracking videos (2026-08-03)
+
+`videos/input/22.mp4`, `30`, `38` and `60` are videos 22, 30, 38 and 60 of
+[VISEM-Tracking](https://arxiv.org/abs/2212.02842) — same rig we inferred
+independently in `utils/config.py` (Olympus CX31, 400x, 45-50 fps, 640x480),
+which is why the constants transfer. Verified on 22: the clip is 1470 frames
+and VISEM annotates 1470; box counts match the detector frame for frame; every
+annotated box lands within 10 px of a detection, median 1.5 px from our head
+keypoint. Loader in `evaluation/visem.py`, ~8 MB per clip, no labelling:
+
+    python -m evaluation.score --visem 38 --sweep
+
+**This replaces the hand-built key.** That key covers 501 of 1470 frames and was
+prefilled by our own tracker before a human corrected it — the bias flagged in
+step 0 below. VISEM is independent, 2.9x longer, and covers all four clips.
+
+### What the independent key changed
+
+| clip | hand key said | VISEM says | per 1470 frames |
+|---|---|---|---|
+| 22 | 3 switches / 501 frames | 8 / 1470 | 8.8 predicted vs 8 — the key was good |
+| 30 | 4 / 301 | 8 / 1470 | 19.5 predicted vs 8 — **over-reported 2.4x** |
+| 38 | 2 / 300 | 22 / 1470 | 9.8 predicted vs 22 — **under-reported 2.2x** |
+| 60 | no key existed | 5 / 1470 | — |
+
+The ranking inverts. This page concludes below that "38.mp4 is the one the
+tracker handles best"; it was the worst by a factor of nearly three, and every
+constant had been tuned to minimise switches on that signal.
+
+### Re-derived settings
+
+Fitted on VISEM 22/30/38 (4,410 frames) with **60 held out entirely**:
+
+| | switches | mean IDF1 (4 clips) |
+|---|---|---|
+| previous defaults | 43 | 0.8713 |
+| re-derived | **35** | 0.8758 |
+
+`match_thresh` 0.95 -> 0.99, `motion_gate` 15 -> 25 px, `motion_weight`
+0.5 -> 0.7. Per clip: 38 goes 22 -> 17 switches with IDF1 0.9004 -> 0.9564;
+30 goes 8 -> 6 but loses IDF1 0.8791 -> 0.8358; 22 is unchanged; the **holdout
+improves, 5 -> 4 switches and IDF1 0.7887 -> 0.7941**, which is what says these
+are real and not fitted.
+
+The holdout earned its keep: `track_buffer=10` scored best of anything on the
+fit set (28 switches) and nearly doubled the holdout's (4 -> 9). Rejected.
+
+### History-based re-acquisition (2026-08-03) — works
+
+Two failures were reported by eye on 22.mp4 and both were traced. Neither was a
+cost-function problem:
+
+* **track 13 dies at frame 116.** A motile cell passes an immotile one. Raw
+  detections drop 11 -> 10 while the key still shows two cells, and *zero*
+  duplicates were suppressed — the detector merged them into one box for seven
+  frames. Nothing in the tracker can recover an identity that was never
+  detected.
+* **tracks 4 and 32 exchange at frame 1005.** Same cause, twelve frames long:
+  detections drop 10 -> 9 at frame 993, one blob is shared until 1004, and the
+  two come apart onto each other's cells. The key logs it as a double switch,
+  which is what a swap looks like.
+
+The second one *is* fixable. During the occlusion the coasting track is scored
+against a Kalman state whose last corrections came from the frames where the
+detector was already blending the two cells. Extrapolating instead from the
+track's own earlier observations separates them again:
+
+| freeze point | immotile track's prediction | picks |
+|---|---|---|
+| frame 989 | 1.8 px from its own cell, 17.4 px from the other | correct |
+| frame 991 | 5.0 px / 16.2 px | correct |
+| frame 992 (last before merge) | 18.1 px / 13.2 px | **swapped** |
+
+Only the *lost* track needs this — once its cost is right the Hungarian
+assignment places the other by elimination, so no detection has to be withheld.
+That matters, because withholding is the version tried before and it cost seven
+cell-frames for nothing.
+
+Implemented as `history_lag` / `history_window` on `_ORUSTrack`. Fitted on
+22/30/38 with 60 held out:
+
+| | switches | mean IDF1 (4 clips) |
+|---|---|---|
+| off | 35 | 0.8758 |
+| lag=8, window=10 | **29** | **0.9142** |
+
+Frame 1005 is gone from 22.mp4. Per clip 8->6, 6->7, 17->12, holdout 4->4.
+Caveat worth keeping: the sweep ranged 25-34 switches across 15 settings on
+about 30 events, so a swing of two or three is noise. IDF1 is the sounder
+signal and it improves at nearly every setting.
+
+### Fragmentation (2026-08-03) — the diagnosis was wrong, the fix is smaller
+
+"Sperm vanish for a few frames and come back" looked like fragmentation, i.e.
+the identity being lost and restarted under a new number. Measured, it is
+almost never that:
+
+| clip | tracks | same-identity gaps | missing frames | tracks that truly died and restarted |
+|---|---|---|---|---|
+| 22 | 41 | 22 | 75 | 2 |
+| 30 | 59 | 76 | 557 | 1 |
+| 38 | 45 | 30 | 222 | 1 |
+| 60 | 49 | 121 | 457 | 2 |
+| **total** | 194 | **249** | **1,311** | **6** |
+
+The reason is that ByteTrack already does the repair internally: lost tracks
+stay in the association pool (`joint_stracks(tracked_stracks, lost_stracks)`)
+for `track_buffer * fps/30` = 49 frames. A cell can disappear for a second and
+get its own number back. What is left is a *hole in an intact trajectory*, not
+a renamed track — so renaming, the obvious fix, addresses 6 events out of 249.
+
+Two things were built:
+
+* **`Trajectory.fill_gaps`** — interpolates the missing frames and marks them
+  `observed=False`. `casa.metrics` then scores **observed points only**. That
+  separation is the point: a filled point sits exactly on the straight line
+  between its neighbours, and ALH and BCF measure the wobble around that line,
+  so admitting them would report less lateral movement the more frames the
+  detector missed. VCL is unaffected either way — a straight interpolation has
+  the same length as the chord it replaces.
+* **`repair_fragments`** — joins a track that continues a dead one, refusing
+  any pair that overlapped in time. Velocity is fitted ignoring the last 8
+  frames before death, for the same reason the 4/32 crossing needed it: the
+  tail is already contaminated by the collision.
+
+Scored on the repaired identities (not just on what ByteTrack emits, which
+cannot see a post-pass at all):
+
+| join gate | switches | mean IDF1 | note |
+|---|---|---|---|
+| off | 29 | 0.9030 | |
+| 30 px | 26 | 0.8934 | 6 joins, but clip 60 IDF1 0.794 -> 0.753 |
+| **20 px** | **28** | **0.9036** | 1 join, no clip regresses |
+| 10 px | 29 | 0.9030 | never fires |
+
+The wide gate buys three switches by welding two different cells together on
+clip 60 — a trade the switch count barely notices and IDF1 punishes. Shipped at
+20 px, where it fires once in 5,880 frames and nothing gets worse.
+
+**Honest summary: the stitcher is nearly worthless here and is kept only
+because it is free and guards a real failure mode. The gap filling is the part
+that addresses what was actually observed**, and it changes no score by design
+— its value is a continuous stored trajectory, not a better MOT number.
+
+### Retried against the better key, still dead
+
+* **Reducing `dedupe_distance`** — the hypothesis was that a 14 px suppression
+  radius, tuned where the median cell's nearest neighbour is 110 px away,
+  deletes real cells in a crowded field where 10.8% of cells have a neighbour
+  inside it. Falsified twice: on the dense clip, switching suppression off
+  recovers 1.4% more cell-frames but costs 12 identities and 13 frames of
+  median track length; against VISEM, 0 px gives **77 switches against 40**.
+  14 px is correct. The 405 suppressions on the dense clip are real duplicates.
+* **Observation-Centric Re-Update** (OC-SORT's ORU) — implemented in
+  `_ORUSTrack`, rewinds to the last observed state and replays the filter over
+  interpolated virtual observations before a re-acquisition. It fires (22 times
+  on VISEM 22, gaps of 2-13) and costs 2 switches and 0.006 IDF1. These clips
+  lose a track for a mean of 0.9 frames, so there is no accumulated drift to
+  repair. Left in the code at `oru_max_gap=0`, because the dense clip loses
+  tracks for a mean of 6.8 frames and has no ground truth yet.
+
+### What is still unmeasured
+
+`1_eB8evBLQ.avi` (55 cells/frame, 5th-percentile neighbour spacing 6.4 px) has
+no ground truth, and the proxies available without one — `IDs/cell`,
+`mean_gaps`, track length — **cannot see a swap at all**, only fragmentation.
+By those proxies it fragments no worse than 22.mp4 (1.5 vs 1.6 IDs per cell)
+while losing tracks 7.7x more often. Nothing here should be read as evidence
+about that clip.
+
+The four `.wmv` clips are from the actual rig and the detector finds ~0 cells in
+them. Their contrast is fine (220 grey levels, std 17.8, against 22.mp4's 10.8),
+so this is domain shift, not the converter bug in `main.py`. Unrelated to
+tracking and probably more urgent.
+
 ---
 
 ## Where this actually landed (2026-07-31)

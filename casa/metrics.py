@@ -133,7 +133,18 @@ def compute_metrics(trajectory: Trajectory, fps: float, microns_per_pixel: float
     if len(trajectory) < 2:
         raise ValueError(f"track {trajectory.track_id}: need >= 2 points, got {len(trajectory)}")
 
-    raw = trajectory.head_array * microns_per_pixel
+    # Measured points only. Gaps are interpolated for display and for a
+    # continuous stored path (see Trajectory.fill_gaps), but a filled point sits
+    # exactly on the straight line between its neighbours, and ALH and BCF are
+    # defined by the wobble around that line — letting them in would report
+    # less lateral movement the more frames the detector missed. VCL is
+    # unaffected either way, since a straight interpolation has the same length
+    # as the chord it replaces.
+    mask = trajectory.observed_mask
+    if int(mask.sum()) < 2:
+        raise ValueError(f"track {trajectory.track_id}: fewer than 2 observed points")
+    frames = np.array(trajectory.frames, dtype=np.float64)[mask]
+    raw = trajectory.head_array[mask] * microns_per_pixel
     smoothed = _smooth_path(raw, SMOOTHING_WINDOW)
 
     # Use the real elapsed time between the first and last sample, not the
@@ -145,7 +156,7 @@ def compute_metrics(trajectory: Trajectory, fps: float, microns_per_pixel: float
     # produced a reported 4363 um/s on 30.mp4 (15x the fastest speed any
     # human sperm has been recorded at) on a 14-point track that actually
     # spanned far more real frames than that.
-    duration_s = (trajectory.frames[-1] - trajectory.frames[0]) / fps
+    duration_s = (frames[-1] - frames[0]) / fps
 
     vcl = _path_length(raw) / duration_s
     vsl = float(np.linalg.norm(raw[-1] - raw[0])) / duration_s
