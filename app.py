@@ -462,6 +462,20 @@ def top_performer_ranking(df: pd.DataFrame) -> list[int]:
     return [int(t) for t in ok["track_id"]]
 
 
+def _stale(clip: Path, trajectories_path: Path) -> bool:
+    """Whether a cached highlight clip predates the data it should reflect.
+
+    A clip's filename is keyed on track_id (and, for the top-N clip, the
+    ranking) but not on *when* it was rendered, so re-running tracking — a
+    tuning change, a fragment-repair fix, anything — can leave an
+    already-cached clip on disk that still shows the old, uncorrected
+    identities while the video and metrics next to it have moved on. Same
+    fix as ``load_metrics``: compare against the source's mtime instead of
+    trusting "a file with this name exists".
+    """
+    return not clip.exists() or clip.stat().st_mtime < trajectories_path.stat().st_mtime
+
+
 def _top_clip(paths: dict[str, Path], stem: str, ranking: list[int], top_n: int) -> Path | None:
     """Path to a clip marking the best ``top_n`` cells in each frame."""
     if not paths["trajectories"].exists() or not ranking:
@@ -474,7 +488,7 @@ def _top_clip(paths: dict[str, Path], stem: str, ranking: list[int], top_n: int)
     # would change on every restart and the cached clip would never be reused.
     digest = hashlib.sha1("-".join(str(t) for t in ranking).encode()).hexdigest()[:8]
     clip = HIGHLIGHT_DIR / f"{stem}_top{top_n}_{digest}.mp4"
-    if not clip.exists():
+    if _stale(clip, paths["trajectories"]):
         # Trails are off by default because a full field of 50 cells turns into
         # spaghetti — but that is exactly what thinning removes, so a short
         # trail here makes each marked cell's path readable.
@@ -494,7 +508,7 @@ def _highlight_clip(paths: dict[str, Path], stem: str, track_id: int) -> Path | 
         return None
 
     clip = HIGHLIGHT_DIR / f"{stem}_id{track_id}.mp4"
-    if not clip.exists():
+    if _stale(clip, paths["trajectories"]):
         with st.spinner(f"Preparing the clip for sperm {track_id}…"):
             if render_highlight(paths["source"], trajectory, track_id, clip) is None:
                 return None
