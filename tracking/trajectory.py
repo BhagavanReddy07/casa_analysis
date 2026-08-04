@@ -145,7 +145,7 @@ def repair_fragments(
     max_distance: int = 20,
     lag: int = 8,
     window: int = 10,
-) -> int:
+) -> dict[int, int]:
     """Join a track that is plainly the continuation of a dead one.
 
     ByteTrack already re-acquires a lost identity for ``track_buffer * fps/30``
@@ -175,9 +175,13 @@ def repair_fragments(
     cells together on clip 60, which the switch count barely notices and IDF1
     punishes. 20 px is the widest gate where no clip regresses.
 
-    Returns how many joins were made.
+    Returns the joins made, as ``{old_id: canonical_id}``. This is not just a
+    count: the video overlay is drawn from live per-frame tracker output, in
+    a separate pass, before this ever runs — a stitch here does nothing to
+    what has already been rendered unless the renderer is told which old IDs
+    now mean which canonical one. That is what this mapping is for.
     """
-    joins = 0
+    renamed: dict[int, int] = {}
     # Oldest first, so A->B->C collapses in one pass: B is merged into A before
     # C is considered, and C then matches the extended A.
     for track_id in sorted(trajectories, key=lambda t: trajectories[t].frames[0]):
@@ -209,10 +213,10 @@ def repair_fragments(
         target.neck_points += candidate.neck_points
         target.observed = list(target.observed_mask) + list(candidate.observed_mask)
         del trajectories[track_id]
-        joins += 1
+        renamed[track_id] = best
         logger.info("track %d continues track %d (%.1f px from prediction, %d frame gap)",
                     track_id, best, best_gap, gap)
-    return joins
+    return renamed
 
 
 class TrajectoryBuilder:
@@ -230,30 +234,34 @@ class TrajectoryBuilder:
             traj.neck_points.append(track.detection.neck)
             traj.observed.append(True)
 
-    @property
-    def trajectories(self) -> dict[int, Trajectory]:
-        """Live view, including tracks too short to keep. Used for drawing."""
-        return self._trajectories
-
-    def finalize(self, min_length: int = 10, repair: bool = True) -> dict[int, Trajectory]:
+    def finalize(
+        self, min_length: int = 10, repair: bool = True,
+    ) -> tuple[dict[int, Trajectory], dict[int, int]]:
         """Return trajectories long enough to measure, gaps repaired.
 
         Order matters. Fragments are joined *before* the length filter, so a
         cell broken into two short pieces is measured as one long track instead
         of being discarded twice; and gaps are filled last, so a join's own gap
         is filled too.
+
+        Also returns the fragment-repair rename map, ``{old_id: canonical_id}``
+        — empty when ``repair`` is False. The video overlay is drawn from live
+        per-frame tracker output *before* this ever runs (see
+        ``detection/inference.py``), so without this map a stitch made here
+        would exist in the metrics and never appear on screen.
         """
         kept = dict(self._trajectories)
+        renamed: dict[int, int] = {}
         if repair:
-            joins = repair_fragments(kept)
+            renamed = repair_fragments(kept)
             filled = sum(t.fill_gaps() for t in kept.values())
             logger.info("repaired %d fragment(s), filled %d frame(s) across %d gap(s)",
-                        joins, filled, sum(1 for t in kept.values() if t.filled))
+                        len(renamed), filled, sum(1 for t in kept.values() if t.filled))
 
         kept = {k: v for k, v in kept.items() if len(v) >= min_length}
         logger.info("kept %d/%d trajectories at min_length=%d",
                     len(kept), len(self._trajectories), min_length)
-        return kept
+        return kept, renamed
 
     def summary(
         self, min_length: int = 10,
@@ -330,13 +338,24 @@ if __name__ == "__main__":
                           observed=[True] * len(frames))
 
     broken = {2: _track(2, [0, 1, 2, 3, 4]), 3: _track(3, [7, 8, 9, 10])}
-    assert repair_fragments(broken) == 1, "a clean continuation was not joined"
+    remap = repair_fragments(broken)
+    assert remap == {3: 2}, f"a clean continuation was not joined correctly: {remap}"
     assert list(broken) == [2], f"join kept the wrong id: {list(broken)}"
     assert broken[2].frames == [0, 1, 2, 3, 4, 7, 8, 9, 10]
 
     overlapping = {4: _track(4, [0, 1, 2, 3, 4]), 5: _track(5, [3, 4, 5, 6])}
-    assert repair_fragments(overlapping) == 0, "joined two cells that co-existed"
+    assert repair_fragments(overlapping) == {}, "joined two cells that co-existed"
     assert len(overlapping) == 2
+
+    # A chain: 7 continues 6, then 8 continues the now-extended 6. The map
+    # must point both 7 and 8 straight at 6, not 8 at 7 — a video overlay
+    # relabels every frame in one dict lookup, so a two-hop chain would leave
+    # 8's frames unrelabelled.
+    chained = {6: _track(6, [0, 1, 2, 3, 4]), 7: _track(7, [7, 8, 9, 10]),
+              8: _track(8, [14, 15, 16, 17])}
+    chain_remap = repair_fragments(chained)
+    assert chain_remap == {7: 6, 8: 6}, f"chained merge did not collapse to one id: {chain_remap}"
+    assert list(chained) == [6]
 
     # A gap longer than the limit stays open: a straight line across a long
     # absence is a guess, not a measurement.

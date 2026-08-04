@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -18,7 +19,7 @@ from casa.metrics import MAX_PLAUSIBLE_VCL, compute_batch
 from casa.motility import MotilityGrade, MotilityThresholds, classify, summarize
 from detection.detector import SpermDetector
 from tracking.tracker import SpermTracker, TrackerConfig
-from tracking.trajectory import TrajectoryBuilder
+from tracking.trajectory import Trajectory, TrajectoryBuilder
 from utils.config import Config, MICRONS_PER_PIXEL
 from utils.draw import draw_count, draw_detections, draw_tracks
 from utils.helpers import is_image, output_path, resolve_source
@@ -63,6 +64,19 @@ def run_video(
     computed once tracking finishes and written to
     ``<output>/<stem>_metrics.csv``. Press ``q`` to stop early when ``show``
     is enabled.
+
+    Tracking runs in two passes, not one. A cell the detector loses briefly
+    can come back from ``tracking.trajectory.repair_fragments`` under its
+    *old* identity rather than the new one ByteTrack gave it — but only after
+    the whole clip has been seen once, since the fix depends on where the cell
+    goes next, not just where it has been. Drawing frame-by-frame during
+    tracking, as a single pass necessarily does, bakes in whichever id ByteTrack
+    had assigned *at that moment* — the video would keep showing the swap
+    ``repair_fragments`` was built to undo. So detection and tracking finish
+    completely first; the corrected identities come out of that; only then is
+    anything drawn, from those corrected identities, in a second read of the
+    source. Re-decoding the file is far cheaper than the detector pass it
+    follows, and cheaper than holding every raw frame in memory to avoid it.
     """
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
@@ -85,11 +99,6 @@ def run_video(
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     dst = output_path(source, config.output_dir, ".mp4", "tracked" if track else "annotated")
-    writer = cv2.VideoWriter(str(dst), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-    if not writer.isOpened():
-        cap.release()
-        raise RuntimeError(f"cannot open video writer: {dst}")
-
     tracker_config = tracker_config or TrackerConfig()
     tracker = SpermTracker(tracker_config, frame_rate=fps) if track else None
     builder = TrajectoryBuilder() if track else None
@@ -100,50 +109,98 @@ def run_video(
     frames = 0
     detected = 0
     started = time.perf_counter()
-    try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
 
-            detections = detector.detect(frame)
-
-            if tracker is not None and builder is not None:
-                tracks = tracker.update(detections, frames)
+    if tracker is not None and builder is not None:
+        # Pass 1 — detect and track only. No drawing, no writer: whatever gets
+        # marked on screen has to reflect the *repaired* identities, which
+        # do not exist until this pass is over.
+        per_frame_tracks: list[list] = []
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                tracks = tracker.update(detector.detect(frame), frames)
                 builder.add(tracks)
+                per_frame_tracks.append(tracks)
+
+                frames += 1
+                detected += len(tracks)
+                if frames % LOG_EVERY == 0:
+                    logger.info("frame %d/%s  mean %.1f cells/frame",
+                                frames, total if total > 0 else "?", detected / frames)
+                if max_frames is not None and frames >= max_frames:
+                    break
+        finally:
+            cap.release()
+
+        trajectories, id_map = builder.finalize(tracker_config.min_track_length)
+
+        # Pass 2 — draw from the repaired identities. id_map.get(old, old)
+        # relabels a track exactly where repair_fragments joined it to an
+        # earlier one; every other id passes through unchanged.
+        writer = cv2.VideoWriter(str(dst), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        if not writer.isOpened():
+            raise RuntimeError(f"cannot open video writer: {dst}")
+        replay = cv2.VideoCapture(source)
+        try:
+            for frame_index, raw_tracks in enumerate(per_frame_tracks):
+                ok, frame = replay.read()
+                if not ok:
+                    break
+                corrected = [replace(t, track_id=id_map.get(t.track_id, t.track_id))
+                            for t in raw_tracks]
                 annotated = draw_count(
-                    draw_tracks(frame, tracks, builder.trajectories, config.draw),
-                    len(tracks), config.draw,
+                    draw_tracks(frame, corrected, trajectories, config.draw),
+                    len(corrected), config.draw,
                 )
-                counted = len(tracks)
-            else:
+                writer.write(annotated)
+                if show:
+                    cv2.imshow("Sperm CASA - detection", annotated)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        logger.info("stopped by user at frame %d", frame_index)
+                        break
+        finally:
+            replay.release()
+            writer.release()
+            if show:
+                cv2.destroyAllWindows()
+    else:
+        # Detection-only: nothing to repair, so a single pass is exactly
+        # right — this is the path a plain --source run without --track uses.
+        writer = cv2.VideoWriter(str(dst), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        if not writer.isOpened():
+            cap.release()
+            raise RuntimeError(f"cannot open video writer: {dst}")
+        trajectories, id_map = {}, {}
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                detections = detector.detect(frame)
                 annotated = draw_count(
                     draw_detections(frame, detections, config.draw), len(detections), config.draw
                 )
-                counted = len(detections)
+                writer.write(annotated)
 
-            writer.write(annotated)
-
-            frames += 1
-            detected += counted
-
-            if show:
-                cv2.imshow("Sperm CASA - detection", annotated)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    logger.info("stopped by user at frame %d", frames)
+                frames += 1
+                detected += len(detections)
+                if show:
+                    cv2.imshow("Sperm CASA - detection", annotated)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        logger.info("stopped by user at frame %d", frames)
+                        break
+                if frames % LOG_EVERY == 0:
+                    logger.info("frame %d/%s  mean %.1f cells/frame",
+                                frames, total if total > 0 else "?", detected / frames)
+                if max_frames is not None and frames >= max_frames:
                     break
-
-            if frames % LOG_EVERY == 0:
-                logger.info("frame %d/%s  mean %.1f cells/frame",
-                            frames, total if total > 0 else "?", detected / frames)
-
-            if max_frames is not None and frames >= max_frames:
-                break
-    finally:
-        cap.release()
-        writer.release()
-        if show:
-            cv2.destroyAllWindows()
+        finally:
+            cap.release()
+            writer.release()
+            if show:
+                cv2.destroyAllWindows()
 
     elapsed = time.perf_counter() - started
     logger.info(
@@ -167,7 +224,10 @@ def run_video(
         # A full-length clip naturally accumulates new IDs as cells swim into
         # or out of frame — that alone isn't fragmentation. Only warn when
         # most new tracks start away from the edge, i.e. an existing,
-        # still-in-frame cell was dropped and re-born under a new ID.
+        # still-in-frame cell was dropped and re-born under a new ID. This
+        # counts raw ByteTrack output, before repair_fragments — it is meant
+        # to describe how much the tracker itself fragmented, independent of
+        # how much of that the repair pass then papered over.
         ideal = detected / frames if frames else 0.0
         if ideal and stats["tracks"] > 3 * ideal and stats["edge_birth_fraction"] < 0.5:
             logger.warning(
@@ -177,30 +237,33 @@ def run_video(
             )
 
         if metrics:
-            _write_metrics(builder, fps, microns_per_pixel, motility_thresholds or MotilityThresholds(),
-                           tracker_config.min_track_length, dst)
+            _write_metrics(trajectories, fps, microns_per_pixel,
+                           motility_thresholds or MotilityThresholds(), dst)
 
     return dst
 
 
 def _write_metrics(
-    builder: TrajectoryBuilder,
+    trajectories: dict[int, Trajectory],
     fps: float,
     microns_per_pixel: float,
     thresholds: MotilityThresholds,
-    min_track_length: int,
     video_dst: Path,
 ) -> Path | None:
     """Compute CASA kinematics for every usable trajectory and save a CSV.
+
+    Takes the already-repaired, already-length-filtered trajectories —
+    ``run_video`` produces these once, from ``TrajectoryBuilder.finalize``,
+    and both the video overlay and this CSV are drawn from that same result
+    rather than each calling ``finalize`` (and re-running the repair) again.
 
     Returns None (and logs why) if no trajectory was long enough to measure —
     a bad calibration or overly strict min_track_length shouldn't crash the
     run, since the video output above is still valid.
     """
-    trajectories = builder.finalize(min_track_length)
     if not trajectories:
-        logger.warning("no trajectory reached min_track_length=%d — skipping CASA metrics",
-                       min_track_length)
+        logger.warning("no trajectory reached the length required to measure — "
+                       "skipping CASA metrics")
         return None
 
     kinematics = compute_batch(trajectories, fps, microns_per_pixel)
