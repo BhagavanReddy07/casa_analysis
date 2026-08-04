@@ -169,16 +169,28 @@ jobs:
 
       - name: Re-analyse the videos this push outdated
         run: |
-          # Detached on purpose: a clip takes ~15-20 min on the instance's two
-          # vCPUs and the deploy must not sit there for an hour. Results appear
-          # in the dashboard clip by clip as each one finishes.
+          # Detached on purpose: a clip takes a while and the deploy must not
+          # sit there for an hour. Results appear in the dashboard clip by
+          # clip as each one finishes.
           # flock -n makes a second deploy skip rather than start a rival
           # rebuild over the same files, and nice keeps the app responsive
           # while it runs. main.py only re-analyses clips whose stored
           # fingerprint differs from the current detection/tracking/CASA code,
           # so a docs-only push rebuilds nothing.
+          #
+          # The four ANALYSIS_* exports matter: this runs as a plain SSH
+          # command, not through systemd, so it does NOT inherit casa.service's
+          # Environment= lines — only a process systemd itself launches gets
+          # those. Without them, main.py's GPU probe silently reads empty
+          # config and always falls back to this instance's own CPU, even with
+          # the GPU box fully up. Same four values as the systemd unit above,
+          # so both places main.py can run from agree on where the GPU box is.
           ssh -i ~/.ssh/deploy.pem "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" '
             cd ~/sperm_CASA
+            export ANALYSIS_HOST=${{ secrets.ANALYSIS_HOST }}
+            export ANALYSIS_USER=ubuntu
+            export ANALYSIS_KEY_PATH=/home/ubuntu/.ssh/sperm_analysis_key.pem
+            export ANALYSIS_APP_DIR=/home/ubuntu/sperm_CASA
             setsid flock -n videos/rebuild.lock \
               nice -n 10 .venv/bin/python main.py --rebuild \
               >> videos/rebuild.log 2>&1 < /dev/null &
