@@ -90,20 +90,45 @@ STYLE = """
     border-radius: 8px;
   }
 
-  /* Per-video delete button in the "Sample" popover: a plain Streamlit
-     button sized for full-width text overflows its narrow column when the
-     content is just an emoji, so it needs an explicit square box. Targeted
-     via the st-key-<key> class Streamlit adds to keyed elements (1.38+)
-     rather than nth-child, because the confirm/cancel row below it is also
-     a 2-column layout and would otherwise match the same selector. */
-  div[class*="st-key-delete_"] div[data-testid="stButton"] button,
+  /* The "Sample" popover trigger, styled to match the plain black
+     st.selectbox it replaced (dark surface, red focus border) instead of
+     reading as a generic grey button. The popover body renders in a portal
+     appended elsewhere in the DOM, not as a child of stPopover, so this
+     selector only ever reaches the closed trigger — it is safe from the
+     row/confirm buttons inside the open popover. */
+  div[data-testid="stPopover"] > div > button {
+    background: #0e1117 !important;
+    border: 1px solid rgba(250, 250, 250, 0.2) !important;
+    border-radius: 0.5rem !important;
+    color: #fafafa !important;
+    font-weight: 400 !important;
+    justify-content: space-between !important;
+  }
+  div[data-testid="stPopover"] > div > button:hover,
+  div[data-testid="stPopover"] > div > button:focus {
+    border-color: #ff4b4b !important;
+    color: #ff4b4b !important;
+  }
+
+  /* Per-video delete control in the "Sample" popover: a plain cross, not a
+     button — no border or fill of its own, so it reads as part of the row
+     rather than a separate icon widget. Targeted via the st-key-<key> class
+     Streamlit adds to keyed elements (1.38+) rather than nth-child, because
+     the confirm/cancel row below it is also a 2-column layout and would
+     otherwise match the same selector. */
   div[class*="st-key-delete_"] button {
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
     width: 2.5rem;
     height: 2.5rem;
     padding: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    color: #8a8a86 !important;
+    font-size: 1.1rem;
+  }
+  div[class*="st-key-delete_"] button:hover {
+    color: #ff4b4b !important;
+    background: transparent !important;
   }
   div[class*="st-key-delete_"] button p { margin: 0; line-height: 1; }
   div[class*="st-key-select_"] button { min-height: 2.5rem; }
@@ -640,7 +665,7 @@ def main() -> None:
                             st.session_state["selected_stem"] = v
                             st.rerun()
                     with row_delete:
-                        if st.button("🗑️", key=f"delete_{v}", help=f"Delete {v}"):
+                        if st.button("✕", key=f"delete_{v}", help=f"Delete {v}"):
                             st.session_state["confirm_delete"] = v
                             st.rerun()
 
