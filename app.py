@@ -626,7 +626,9 @@ def render_upload(tracker_config: TrackerConfig) -> None:
                       "This is slower; try again later if you want the GPU box to pick it up.")
 
     if not used_remote:
-        config = Config(conf=tracker_config.track_low_thresh, output_dir=OUTPUT_DIR)
+        config = Config(weights=Path("models/best_v2.pt"),
+                        conf=tracker_config.track_low_thresh,
+                        output_dir=OUTPUT_DIR)
         config.draw.show_conf = False
         config.draw.trail_length = 0
 

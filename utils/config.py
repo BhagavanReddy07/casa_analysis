@@ -67,7 +67,10 @@ class DrawConfig:
 class Config:
     """Everything the detection stage needs."""
 
-    weights: Path = Path("models/best.pt")
+    # The deployed Streamlit app now uses the retrained v2 checkpoint by
+    # default for new uploads. The legacy baseline remains available as
+    # models/best.pt for reference and comparison.
+    weights: Path = Path("models/best_v2.pt")
     conf: float = 0.25
     iou: float = 0.5
     # YOLO-pose emits (0, 0) for a keypoint it cannot localize. Those land in

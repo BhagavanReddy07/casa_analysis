@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sperm detection and CASA-style overlay")
     parser.add_argument("--source", default="videos/input/22.mp4",
                         help="video path, image path, or camera index")
-    parser.add_argument("--weights", type=Path, default=Path("models/best.pt"))
+    parser.add_argument("--weights", type=Path, default=Path("models/best_v2.pt"))
     parser.add_argument("--output", type=Path, default=Path("videos/output"))
     parser.add_argument("--conf", type=float, default=None,
                         help="confidence threshold (default 0.25, or 0.10 with --track)")
