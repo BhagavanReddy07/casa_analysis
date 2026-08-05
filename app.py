@@ -9,16 +9,16 @@ pipeline and then behave identically to the preloaded ones.
 
 from __future__ import annotations
 
-import hashlib
+import json
 import logging
 import os
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from casa.metrics import MAX_PLAUSIBLE_VCL
-from casa.motility import MotilityThresholds
 from main import VIDEO_SUFFIXES
 from detection.detector import SpermDetector
 from detection.inference import run
@@ -111,28 +111,79 @@ STYLE = """
     color: #ff4b4b !important;
   }
 
-  /* Per-video delete control in the "Sample" popover: a plain cross, not a
-     button — no border or fill of its own, so it reads as part of the row
-     rather than a separate icon widget. Targeted via the st-key-<key> class
-     Streamlit adds to keyed elements (1.38+) rather than nth-child, because
-     the confirm/cancel row below it is also a 2-column layout and would
-     otherwise match the same selector. */
-  div[class*="st-key-delete_"] button {
-    background: transparent !important;
-    border: none !important;
+  /* The sample list fills the whole dropdown as one unbroken box: the
+     popover body supplies the only border, and every row is a flush
+     full-width strip with no divider, radius, margin or gap of its own —
+     those are what left visible seams between rows before. `*` +
+     !important is needed because Streamlit sets each button's own
+     radius/shadow inline, and the column gap is likewise inline, so
+     `gap: 0` needs !important too. */
+  div[class*="st-key-row_"] div[data-testid="stHorizontalBlock"] { gap: 0 !important; }
+  div[class*="st-key-row_"] * {
+    border-radius: 0 !important;
     box-shadow: none !important;
-    width: 2.5rem;
-    height: 2.5rem;
+  }
+  div[class*="st-key-row_"] button {
+    border: none !important;
+    min-height: 2.6rem;
+    padding: 0.4rem 0.9rem;
+  }
+  /* Both button kinds, not just secondary: the selected row uses the
+     primary kind, whose red fill would otherwise cover only the name half
+     of the row and leave the delete cell black. The selection is carried by
+     the row's red border and red label instead, so the box stays uniform. */
+  div[class*="st-key-select_"] button {
+    background: #0e1117 !important;
+    color: #fafafa !important;
+    font-weight: 400 !important;
+    justify-content: flex-start !important;
+  }
+  div[class*="st-key-select_"] button[data-testid="stBaseButton-primary"] {
+    color: #ff4b4b !important;
+  }
+  /* justify-content on the button alone is not enough — its label sits in a
+     full-width inner wrapper that centres the text on its own. */
+  div[class*="st-key-select_"] button > div {
+    width: 100%;
+    justify-content: flex-start !important;
+    text-align: left !important;
+  }
+  div[class*="st-key-select_"] button:hover,
+  div[class*="st-key-select_"] button:focus {
+    color: #ff4b4b !important;
+  }
+  div[class*="st-key-delete_"] button {
+    background: #0e1117 !important;
+    width: 2.6rem;
     padding: 0;
     color: #8a8a86 !important;
-    font-size: 1.1rem;
+    font-size: 1.15rem;
   }
   div[class*="st-key-delete_"] button:hover {
     color: #ff4b4b !important;
-    background: transparent !important;
   }
   div[class*="st-key-delete_"] button p { margin: 0; line-height: 1; }
-  div[class*="st-key-select_"] button { min-height: 2.5rem; }
+
+  /* The popover body renders in a portal, positioned via inline styles the
+     component computes from the trigger's on-screen rect. Under non-100%
+     browser zoom that rect can read back scaled inconsistently, pushing the
+     panel past the right edge — clamping its width keeps it from running
+     off-screen even when its computed offset drifts. */
+  div[data-testid="stPopoverBody"] {
+    max-width: min(92vw, 340px) !important;
+    border-radius: 0.5rem !important;
+    /* Zero padding so the table meets the dropdown's own edges instead of
+       floating inside it, and the gap between stacked elements goes with it
+       — otherwise Streamlit's default vertical gap reappears between rows. */
+    padding: 0 !important;
+    overflow: hidden;
+  }
+  div[data-testid="stPopoverBody"] div[data-testid="stVerticalBlock"] { gap: 0 !important; }
+  div[class*="st-key-confirm_area"] {
+    border-top: 1px solid rgba(250, 250, 250, 0.25);
+    padding: 12px;
+    gap: 0.5rem !important;
+  }
 
   .casa-caption { color: #9a9a94; font-size: 0.85rem; line-height: 1.5; }
   .casa-ref {
@@ -202,6 +253,14 @@ def delete_video(stem: str, paths: dict[str, Path]) -> None:
     for pattern in (f"{stem}_id*.mp4", f"{stem}_top*.mp4"):
         for clip in HIGHLIGHT_DIR.glob(pattern):
             clip.unlink(missing_ok=True)
+    # The served copies live in their own directory, so deleting the originals
+    # above leaves them behind — and a later upload reusing the stem would
+    # then be shown the previous sample's clips.
+    for served in STATIC_DIR.glob(f"{stem}.h264.mp4"):
+        served.unlink(missing_ok=True)
+    for pattern in (f"{stem}_id*.h264.mp4", f"{stem}_top*.h264.mp4", f"{stem}_tracked.h264.mp4"):
+        for served in STATIC_DIR.glob(pattern):
+            served.unlink(missing_ok=True)
     load_metrics.clear()
 
 
@@ -209,6 +268,14 @@ def delete_video(stem: str, paths: dict[str, Path]) -> None:
 def load_metrics(csv_path: str, mtime: float) -> pd.DataFrame:
     """Read a metrics CSV. ``mtime`` busts the cache when the file changes."""
     return pd.read_csv(csv_path)
+
+
+@st.cache_data(show_spinner=False)
+def _load_trajectories(path: str, mtime: float) -> dict[int, dict]:
+    """Cached wrapper over ``load_trajectories`` — ``st.tabs`` renders every
+    tab's body on every rerun, so the uncached version reparsed this JSON
+    file 2-3 times per click anywhere on the page."""
+    return load_trajectories(Path(path))
 
 
 def unprocessed_videos() -> tuple[list[Path], list[Path]]:
@@ -356,18 +423,136 @@ def render_video_viewer(df: pd.DataFrame, paths: dict[str, Path], stem: str) -> 
                              else (st.container(), None))
 
     with video_col:
-        # Only meaningful over the all-cells overlay: "Original" has no marks
-        # to thin out, and "This cell" is already a single-cell view.
-        show_top = _top_marks_toggle() if view == "All cells" else False
-        _render_main_video(view, selection, paths, stem, inspecting, df, show_top)
+        # The all-cells view gets the custom player: its "Top sperms" switch
+        # and per-cell picker are handled in the browser, so switching keeps
+        # playing from where it was instead of remounting at 0:00. Every other
+        # view is a single fixed clip with nothing to switch between, so plain
+        # st.video is right for them.
+        if view == "All cells" and _render_player(paths, stem, df):
+            pass
+        else:
+            show_top = _top_marks_toggle() if view == "All cells" else False
+            _render_main_video(view, selection, paths, stem, inspecting, df, show_top)
 
     if inspecting and detail_col is not None:
         with detail_col:
             _render_cell_detail(df, paths, selection)
 
 
+# Tall enough for the 4:3 player plus its control row. The iframe cannot size
+# itself to its content, so this is fixed here and the video is bounded by it.
+PLAYER_HEIGHT = 620
+
+PLAYER_HTML = """
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font-family: "Source Sans Pro", system-ui, sans-serif; color: #fafafa; }
+  .bar { display: flex; align-items: center; gap: 18px; margin-bottom: 10px; }
+  .sw { display: flex; align-items: center; gap: 9px; cursor: pointer; user-select: none; }
+  .sw input { display: none; }
+  .track {
+    width: 40px; height: 22px; border-radius: 999px; background: #3a3a38;
+    position: relative; transition: background .15s;
+  }
+  .track::after {
+    content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px;
+    border-radius: 50%; background: #fafafa; transition: transform .15s;
+  }
+  .sw input:checked + .track { background: #ff4b4b; }
+  .sw input:checked + .track::after { transform: translateX(18px); }
+  /* Height drives the size and width follows the 4:3 ratio — stretching to
+     100% width instead letterboxes the frame inside black side bars, since
+     the element box would be far wider than the footage. */
+  video {
+    height: __VH__px; width: auto; max-width: 100%;
+    border-radius: 8px; display: block;
+  }
+</style>
+
+<div class="bar">
+  <label class="sw" title="__HELP__">
+    <input type="checkbox" id="top"><span class="track"></span><span>Top sperms</span>
+  </label>
+</div>
+<video id="v" autoplay muted loop playsinline></video>
+
+<script>
+  const SRC = __SRC__;
+  const v = document.getElementById("v");
+  const top_ = document.getElementById("top");
+
+  // The whole point of this component: swap the file but keep the position,
+  // so toggling never restarts the clip from 0:00. The clamp guards a target
+  // clip that is shorter than the one being left.
+  function show(url) {
+    if (!url || v.dataset.url === url) return;
+    // The first call has no source loaded yet, so the element is paused and
+    // currentTime is 0 — carrying those over would leave the opening clip
+    // sitting on a blank frame. The `autoplay` attribute alone is not
+    // enough here: it fires inconsistently when the src is assigned from
+    // script rather than present in the markup.
+    const first = !v.dataset.url;
+    const at = first ? 0 : v.currentTime;
+    const resume = first || !v.paused;
+    v.dataset.url = url;
+    v.src = url;
+    v.addEventListener("loadedmetadata", () => {
+      if (at > 0 && isFinite(v.duration) && v.duration > 0) {
+        v.currentTime = Math.min(at, v.duration - 0.05);
+      }
+      if (resume) v.play().catch(() => {});
+    }, { once: true });
+  }
+
+  top_.addEventListener("change", () => show(top_.checked ? SRC.top : SRC.all));
+  show(SRC.all);
+</script>
+"""
+
+
+def _static_url(path: Path | None) -> str:
+    """URL for a file already transcoded into ``static/``, or "" if absent."""
+    if path is None:
+        return ""
+    served = STATIC_DIR / (path.with_suffix("").name + ".h264.mp4")
+    return f"/app/static/{served.name}" if served.exists() else ""
+
+
+def _render_player(paths: dict[str, Path], stem: str, df: pd.DataFrame) -> bool:
+    """The all-cells player: overlay, top-sperm view and per-cell top clips.
+
+    Returns False when the clips it needs are not on disk yet, so the caller
+    can fall back to ``st.video``. Everything it switches between is chosen in
+    the browser — no Streamlit rerun, which is what keeps playback running
+    instead of restarting.
+    """
+    all_url = _static_url(paths["tracked"])
+    if not all_url:
+        return False
+
+    ranking = top_performer_ranking(df)
+    src = {
+        "all": all_url,
+        "top": _static_url(top_clip_path(stem, HIGHLIGHT_DIR, ranking, MAX_TOP_MARKS))
+               if ranking else "",
+    }
+    html = (PLAYER_HTML
+            .replace("__SRC__", json.dumps(src))
+            .replace("__VH__", str(PLAYER_HEIGHT - 90))
+            .replace("__HELP__", f"Mark only the best swimmers visible in each frame — at "
+                                 f"most {MAX_TOP_MARKS}, progressive first. Immotile cells "
+                                 "are never marked."))
+    components.html(html, height=PLAYER_HEIGHT)
+    return True
+
+
 def _top_marks_toggle() -> bool:
-    """The "Top sperms" switch. Off means the full overlay, every cell marked."""
+    """The "Top sperms" switch, for the ``st.video`` fallback path only.
+
+    The normal all-cells view uses ``_render_player``, whose own switch lives
+    in the browser; this one exists for the case where the statically-served
+    clips are missing and a plain rerun-per-toggle player is all there is.
+    """
     return st.toggle(
         "Top sperms",
         help=f"Mark only the best swimmers visible in each frame — at most "
@@ -385,13 +570,7 @@ def _render_main_video(view: str, selection, paths: dict[str, Path], stem: str,
     elif view == "All cells" and show_top:
         ranking = top_performer_ranking(df)
         source = _top_clip(paths, stem, ranking, MAX_TOP_MARKS) if ranking else None
-        n_prog = int((df["motility"] == "progressive").sum()) if "motility" in df else 0
-        caption = (f"Up to {MAX_TOP_MARKS} best swimmers **visible in each frame**, "
-                   "re-ranked as cells enter and leave. Progressive cells take the "
-                   f"marks first ({n_prog} in this sample), then non-progressive "
-                   "ones swimming hard enough to count. Immotile cells are never "
-                   "marked, so a frame with no good swimmer stays clean. Labels "
-                   "show live rank and tracking ID.")
+        caption = ""
         if source is None:
             if not ranking:
                 st.info("No cell in this sample swims well enough to mark as a top "
@@ -399,7 +578,7 @@ def _render_main_video(view: str, selection, paths: dict[str, Path], stem: str,
                         "rejected as a measurement artifact. Showing all cells.")
             else:
                 st.info("Could not render the top-sperm clip; showing all cells instead.")
-            source = ensure_browser_playable(paths["tracked"])
+            source = ensure_browser_playable(paths["tracked"], out_dir=STATIC_DIR)
             caption = "Amber = head, cyan = neck, with each cell's tracking ID."
     elif view == "This cell" and inspecting:
         caption = (f"Only sperm {selection} is marked — every other cell is left "
@@ -407,74 +586,30 @@ def _render_main_video(view: str, selection, paths: dict[str, Path], stem: str,
         source = _highlight_clip(paths, stem, int(selection))
         if source is None:
             st.info("Could not render a clip for this cell; showing all cells instead.")
-            source = ensure_browser_playable(paths["tracked"])
+            source = ensure_browser_playable(paths["tracked"], out_dir=STATIC_DIR)
             caption = "Amber = head, cyan = neck, with each cell's tracking ID."
     else:
         caption = "Amber = head, cyan = neck, with each cell's tracking ID."
-        source = ensure_browser_playable(paths["tracked"])
+        source = ensure_browser_playable(paths["tracked"], out_dir=STATIC_DIR)
 
-    st.caption(caption)
+    if caption:
+        st.caption(caption)
     # muted is required — browsers block autoplay on videos with audio.
     st.video(str(source), autoplay=True, muted=True, loop=True)
 
 
-# Never mark more than this at once. The point of the view is to pick out the
-# few cells worth watching; past half a dozen marks the frame reads as noise
-# again and there is no advantage over the full overlay.
-MAX_TOP_MARKS = 6
-
-# A non-progressive cell only qualifies if it is genuinely swimming, not just
-# clearing the immotile floor. 2.5x that floor (25 um/s VCL against the 10 um/s
-# cut-off in casa/motility.py) drops the bottom ~30% of non-progressive cells
-# in the reference samples — the ones twitching in place.
-DECENT_VCL_MULTIPLE = 2.5
-
-
-def top_performer_ranking(df: pd.DataFrame) -> list[int]:
-    """Cells worth marking as top performers, best first.
-
-    Eligibility, not just ordering: immotile cells and tracks with rejected
-    measurements are excluded outright, and a non-progressive cell is only
-    admitted if its VCL clears ``DECENT_VCL_MULTIPLE`` times the immotile
-    floor. An empty list is a real answer — it means nothing in the sample is
-    swimming well enough to call a top performer, and nothing gets marked.
-
-    Progressive cells always outrank non-progressive ones. Within progressive
-    the tiebreak is VSL, which measures net forward progress; within
-    non-progressive it is VCL, since by definition they are not progressing
-    and what distinguishes them is raw vigour.
-    """
-    if "motility" not in df or df.empty:
-        return []
-
-    ok = df[df["plausible"].astype(bool)] if "plausible" in df else df
-    decent_vcl = MotilityThresholds().immotile_vcl * DECENT_VCL_MULTIPLE
-    is_progressive = ok["motility"] == "progressive"
-    is_decent_non_prog = (ok["motility"] == "non_progressive") & (ok["vcl_um_s"] >= decent_vcl)
-    ok = ok[is_progressive | is_decent_non_prog]
-    if ok.empty:
-        return []
-
-    ok = ok.assign(
-        _grade=(ok["motility"] != "progressive").astype(int),
-        _score=ok["vsl_um_s"].where(ok["motility"] == "progressive", ok["vcl_um_s"]),
-    ).sort_values(["_grade", "_score"], ascending=[True, False])
-    return [int(t) for t in ok["track_id"]]
-
-
 def _top_clip(paths: dict[str, Path], stem: str, ranking: list[int], top_n: int) -> Path | None:
-    """Path to a clip marking the best ``top_n`` cells in each frame."""
+    """Path to a clip marking the best ``top_n`` cells in each frame.
+
+    ``prerender`` (called right after analysis finishes) already renders and
+    transcodes this, so the normal case here is a plain cache hit — this is
+    just the fallback for anything prerender skipped or that predates it.
+    """
     if not paths["trajectories"].exists() or not ranking:
         return None
-    trajectories = load_trajectories(paths["trajectories"])
-
-    # Keyed by the whole ranking, not just N — the per-frame selection can pull
-    # in any cell, so every ID in the order affects what ends up on screen.
-    # hashlib, not hash() — the builtin is seeded per process, so the filename
-    # would change on every restart and the cached clip would never be reused.
-    digest = hashlib.sha1("-".join(str(t) for t in ranking).encode()).hexdigest()[:8]
-    clip = HIGHLIGHT_DIR / f"{stem}_top{top_n}_{digest}.mp4"
-    if not clip.exists():
+    trajectories = _load_trajectories(str(paths["trajectories"]), paths["trajectories"].stat().st_mtime)
+    clip = top_clip_path(stem, HIGHLIGHT_DIR, ranking, top_n)
+    if not clip.exists() or clip.stat().st_mtime < paths["trajectories"].stat().st_mtime:
         # Trails are off by default because a full field of 50 cells turns into
         # spaghetti — but that is exactly what thinning removes, so a short
         # trail here makes each marked cell's path readable.
@@ -482,23 +617,24 @@ def _top_clip(paths: dict[str, Path], stem: str, ranking: list[int], top_n: int)
         with st.spinner(f"Marking the top {top_n} sperm in each frame…"):
             if render_top_n(paths["source"], trajectories, ranking, top_n, clip, cfg) is None:
                 return None
-    return ensure_browser_playable(clip)
+    return ensure_browser_playable(clip, out_dir=STATIC_DIR)
 
 
 def _highlight_clip(paths: dict[str, Path], stem: str, track_id: int) -> Path | None:
-    """Path to this cell's clip, rendering and transcoding it on first request."""
+    """Path to this cell's clip. See ``_top_clip`` — normally a cache hit."""
     if not paths["trajectories"].exists():
         return None
-    trajectory = load_trajectories(paths["trajectories"]).get(track_id)
+    trajectory = _load_trajectories(
+        str(paths["trajectories"]), paths["trajectories"].stat().st_mtime).get(track_id)
     if trajectory is None:
         return None
 
     clip = HIGHLIGHT_DIR / f"{stem}_id{track_id}.mp4"
-    if not clip.exists():
+    if not clip.exists() or clip.stat().st_mtime < paths["trajectories"].stat().st_mtime:
         with st.spinner(f"Preparing the clip for sperm {track_id}…"):
             if render_highlight(paths["source"], trajectory, track_id, clip) is None:
                 return None
-    return ensure_browser_playable(clip)
+    return ensure_browser_playable(clip, out_dir=STATIC_DIR)
 
 
 def _render_cell_detail(df: pd.DataFrame, paths: dict[str, Path], track_id) -> None:
@@ -534,7 +670,8 @@ def _render_cell_detail(df: pd.DataFrame, paths: dict[str, Path], track_id) -> N
 
     if not paths["trajectories"].exists():
         return
-    trajectory = load_trajectories(paths["trajectories"]).get(int(track_id))
+    trajectory = _load_trajectories(
+        str(paths["trajectories"]), paths["trajectories"].stat().st_mtime).get(int(track_id))
     if trajectory is not None:
         with st.expander("Path travelled", expanded=True):
             st.altair_chart(charts.trajectory_chart(trajectory["head"]),
@@ -641,6 +778,9 @@ def render_upload(tracker_config: TrackerConfig) -> None:
         )
         return
 
+    with st.spinner("Preparing highlight clips…"):
+        prerender(destination.stem, destination, OUTPUT_DIR)
+
     load_metrics.clear()
     where = "the GPU box" if used_remote else "this server"
     st.success(f"Done (on {where}) — **{destination.stem}** is now in the sample list.")
@@ -686,20 +826,24 @@ def main() -> None:
 
                 confirm_target = st.session_state.get("confirm_delete")
                 if confirm_target in all_stems:
-                    st.warning(f"Delete **{confirm_target}** and all its analysis data? "
-                               "This can't be undone.")
-                    confirm_col, cancel_col = st.columns(2)
-                    with confirm_col:
-                        if st.button("Confirm delete", key="confirm_delete_btn", type="primary"):
-                            delete_video(confirm_target, videos[confirm_target])
-                            del st.session_state["confirm_delete"]
-                            if st.session_state.get("selected_stem") == confirm_target:
-                                del st.session_state["selected_stem"]
-                            st.rerun()
-                    with cancel_col:
-                        if st.button("Cancel", key="cancel_delete_btn"):
-                            del st.session_state["confirm_delete"]
-                            st.rerun()
+                    # Keyed so it can carry its own padding — the popover body
+                    # is zero-padded so the row table meets its edges.
+                    with st.container(key="confirm_area"):
+                        st.warning(f"Delete **{confirm_target}** and all its analysis data? "
+                                   "This can't be undone.")
+                        confirm_col, cancel_col = st.columns(2)
+                        with confirm_col:
+                            if st.button("Confirm delete", key="confirm_delete_btn",
+                                         type="primary"):
+                                delete_video(confirm_target, videos[confirm_target])
+                                del st.session_state["confirm_delete"]
+                                if st.session_state.get("selected_stem") == confirm_target:
+                                    del st.session_state["selected_stem"]
+                                st.rerun()
+                        with cancel_col:
+                            if st.button("Cancel", key="cancel_delete_btn"):
+                                del st.session_state["confirm_delete"]
+                                st.rerun()
         else:
             stem = None
             st.info("No analysed videos yet — upload one below.")

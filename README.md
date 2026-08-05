@@ -31,7 +31,8 @@ torch first from https://pytorch.org, then the requirements.
 
 ```
 Sperm_CASA/
-├── models/best.pt          trained YOLO11-pose weights (2 keypoints: head, neck)
+├── models/best.pt          legacy baseline weights (reference)
+├── models/best_v2.pt       current deployed retrained checkpoint (v2)
 ├── videos/
 │   ├── input/              source clips
 │   └── output/             annotated results
@@ -92,6 +93,10 @@ Useful flags: `--conf` (0.25, or 0.10 with `--track`), `--iou` (0.5),
 
 The overlay draws an amber head point, a cyan neck point, the head-neck
 segment and (when tracking) a small ID. No bounding boxes, no class labels.
+
+The deployed Streamlit dashboard now defaults to models/best_v2.pt (v2), the
+new retrained checkpoint. Existing processed videos remain available and are
+not re-run unless you explicitly rebuild or re-upload them.
 
 On CPU expect 3-6 fps, so a full 1470-frame clip takes 4-7 minutes.
 

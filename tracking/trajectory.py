@@ -230,10 +230,29 @@ class TrajectoryBuilder:
             traj.neck_points.append(track.detection.neck)
             traj.observed.append(True)
 
-    @property
-    def trajectories(self) -> dict[int, Trajectory]:
-        """Live view, including tracks too short to keep. Used for drawing."""
-        return self._trajectories
+    def finalize(
+        self, min_length: int = 10, repair: bool = True,
+    ) -> tuple[dict[int, Trajectory], dict[int, int]]:
+        """Return trajectories long enough to measure, gaps repaired.
+
+        Order matters. Fragments are joined *before* the length filter, so a
+        cell broken into two short pieces is measured as one long track instead
+        of being discarded twice; and gaps are filled last, so a join's own gap
+        is filled too.
+
+        Also returns the fragment-repair rename map, ``{old_id: canonical_id}``
+        — empty when ``repair`` is False. The video overlay is drawn from live
+        per-frame tracker output *before* this ever runs (see
+        ``detection/inference.py``), so without this map a stitch made here
+        would exist in the metrics and never appear on screen.
+        """
+        kept = dict(self._trajectories)
+        renamed: dict[int, int] = {}
+        if repair:
+            renamed = repair_fragments(kept)
+            filled = sum(t.fill_gaps() for t in kept.values())
+            logger.info("repaired %d fragment(s), filled %d frame(s) across %d gap(s)",
+                        len(renamed), filled, sum(1 for t in kept.values() if t.filled))
 
     def finalize(self, min_length: int = 10, repair: bool = True) -> dict[int, Trajectory]:
         """Return trajectories long enough to measure, gaps repaired.
@@ -253,7 +272,7 @@ class TrajectoryBuilder:
         kept = {k: v for k, v in kept.items() if len(v) >= min_length}
         logger.info("kept %d/%d trajectories at min_length=%d",
                     len(kept), len(self._trajectories), min_length)
-        return kept
+        return kept, renamed
 
     def summary(
         self, min_length: int = 10,

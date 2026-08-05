@@ -4,6 +4,14 @@
 # EC2 volume.
 maxUploadSize = 50
 headless = true
+# Serves ./static at /app/static/. The video player needs real URLs it can
+# swap between without a Streamlit rerun — st.video re-mounts the element on
+# every rerun, which restarts playback from 0:00. Note this directory is
+# served without authentication; the dashboard has no password set either
+# (CASA_DASHBOARD_PASSWORD is unset in the deploy), so this exposes nothing
+# that was gated before. Setting a password later means fronting this with a
+# real reverse proxy, not relying on the app's own gate.
+enableStaticServing = true
 
 [browser]
 gatherUsageStats = false

@@ -38,6 +38,94 @@ jobs:
           # --delete removes files deleted from the repo, but rsync protects
           # excluded paths from deletion, so videos/ on the server is safe.
 
+      - name: Configure GPU dispatch
+        run: |
+          # The GPU box (ANALYSIS_HOST) is started and stopped by hand to
+          # control cost; app.py's upload path probes it and falls back to
+          # running on this instance when it is off — see
+          # utils/remote_analysis.py. Both pieces this needs live outside
+          # ~/sperm_CASA, so "Sync code" above never touches them: the private
+          # key, and the systemd unit's Environment= lines that point to it.
+          # Written here, on the runner, and shipped over — not built as a
+          # nested heredoc inside the ssh call below, which is a losing fight
+          # with quoting three shells deep.
+          printf '%s\n' "${{ secrets.ANALYSIS_SSH_KEY }}" > /tmp/sperm_analysis_key.pem
+          chmod 600 /tmp/sperm_analysis_key.pem
+
+          cat > /tmp/casa.service <<EOF
+          [Unit]
+          Description=Sperm CASA dashboard
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=ubuntu
+          WorkingDirectory=/home/ubuntu/sperm_CASA
+          Environment=YOLO_CONFIG_DIR=/home/ubuntu/.config/Ultralytics
+          Environment=ANALYSIS_HOST=${{ secrets.ANALYSIS_HOST }}
+          Environment=ANALYSIS_USER=ubuntu
+          Environment=ANALYSIS_KEY_PATH=/home/ubuntu/.ssh/sperm_analysis_key.pem
+          Environment=ANALYSIS_APP_DIR=/home/ubuntu/sperm_CASA
+          ExecStart=/home/ubuntu/sperm_CASA/.venv/bin/streamlit run app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          scp -i ~/.ssh/deploy.pem -o StrictHostKeyChecking=yes \
+            /tmp/sperm_analysis_key.pem /tmp/casa.service \
+            "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/"
+
+          ssh -i ~/.ssh/deploy.pem -o StrictHostKeyChecking=yes \
+            "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" '
+              set -e
+              mkdir -p ~/.ssh && chmod 700 ~/.ssh
+              mv /tmp/sperm_analysis_key.pem ~/.ssh/sperm_analysis_key.pem
+              chmod 600 ~/.ssh/sperm_analysis_key.pem
+              sudo mv /tmp/casa.service /etc/systemd/system/casa.service
+              sudo systemctl daemon-reload
+            '
+
+      - name: Sync code to the GPU box
+        run: |
+          # This runner cannot reach ANALYSIS_HOST directly — it is a private
+          # IP, only reachable from inside the VPC. So the transfer happens
+          # FROM the frontend, which "Sync code" above just gave a fresh
+          # checkout, TO the analysis box over its private IP: one hop within
+          # the VPC instead of a second upload from here over the internet.
+          #
+          # Best-effort. The box is started and stopped by hand to save cost,
+          # so "unreachable during a deploy" is the common case, not a fault —
+          # a deploy must not fail just because nobody happened to have it on.
+          # The cost of that: code there is only as fresh as the last deploy
+          # that caught it powered on. Before this step existed, that gap was
+          # total and permanent — a one-time manual copy that silently drifted
+          # further out of date with every push after it, so main.py --rebuild
+          # and utils/remote_analysis.py were dispatching real analysis to a
+          # box quietly running old tracking logic. Best-effort-but-usually-on
+          # beats always-stale.
+          ssh -i ~/.ssh/deploy.pem -o StrictHostKeyChecking=yes \
+            "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" '
+              if ! ssh -i ~/.ssh/sperm_analysis_key.pem -o BatchMode=yes \
+                   -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+                   ubuntu@${{ secrets.ANALYSIS_HOST }} true 2>/dev/null; then
+                echo "GPU box unreachable - skipping, it will run stale code until a deploy catches it on"
+                exit 0
+              fi
+              cd ~/sperm_CASA
+              tar czf - \
+                --exclude=".git" --exclude=".github" --exclude="videos" \
+                --exclude=".venv" --exclude="__pycache__" --exclude="sperm_pose_baseline" \
+                . | ssh -i ~/.ssh/sperm_analysis_key.pem -o StrictHostKeyChecking=accept-new \
+                  ubuntu@${{ secrets.ANALYSIS_HOST }} "mkdir -p ~/sperm_CASA && tar xzf - -C ~/sperm_CASA"
+              ssh -i ~/.ssh/sperm_analysis_key.pem -o StrictHostKeyChecking=accept-new \
+                ubuntu@${{ secrets.ANALYSIS_HOST }} \
+                "cd ~/sperm_CASA && .venv/bin/pip install -q -r requirements.txt"
+              echo "GPU box code synced"
+          '
+
       - name: Install dependencies and restart
         run: |
           ssh -i ~/.ssh/deploy.pem "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" '
@@ -81,16 +169,28 @@ jobs:
 
       - name: Re-analyse the videos this push outdated
         run: |
-          # Detached on purpose: a clip takes ~15-20 min on the instance's two
-          # vCPUs and the deploy must not sit there for an hour. Results appear
-          # in the dashboard clip by clip as each one finishes.
+          # Detached on purpose: a clip takes a while and the deploy must not
+          # sit there for an hour. Results appear in the dashboard clip by
+          # clip as each one finishes.
           # flock -n makes a second deploy skip rather than start a rival
           # rebuild over the same files, and nice keeps the app responsive
           # while it runs. main.py only re-analyses clips whose stored
           # fingerprint differs from the current detection/tracking/CASA code,
           # so a docs-only push rebuilds nothing.
+          #
+          # The four ANALYSIS_* exports matter: this runs as a plain SSH
+          # command, not through systemd, so it does NOT inherit casa.service's
+          # Environment= lines — only a process systemd itself launches gets
+          # those. Without them, main.py's GPU probe silently reads empty
+          # config and always falls back to this instance's own CPU, even with
+          # the GPU box fully up. Same four values as the systemd unit above,
+          # so both places main.py can run from agree on where the GPU box is.
           ssh -i ~/.ssh/deploy.pem "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" '
             cd ~/sperm_CASA
+            export ANALYSIS_HOST=${{ secrets.ANALYSIS_HOST }}
+            export ANALYSIS_USER=ubuntu
+            export ANALYSIS_KEY_PATH=/home/ubuntu/.ssh/sperm_analysis_key.pem
+            export ANALYSIS_APP_DIR=/home/ubuntu/sperm_CASA
             setsid flock -n videos/rebuild.lock \
               nice -n 10 .venv/bin/python main.py --rebuild \
               >> videos/rebuild.log 2>&1 < /dev/null &

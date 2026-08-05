@@ -17,8 +17,10 @@ from casa.motility import MotilityThresholds
 from detection.detector import SpermDetector
 from detection.inference import run
 from tracking.tracker import TrackerConfig
+from utils import remote_analysis
 from utils.config import MICRONS_PER_PIXEL, Config
 from utils.helpers import setup_logging
+from utils.highlight import prerender
 
 logger = logging.getLogger("casa")
 
@@ -27,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sperm detection and CASA-style overlay")
     parser.add_argument("--source", default="videos/input/22.mp4",
                         help="video path, image path, or camera index")
-    parser.add_argument("--weights", type=Path, default=Path("models/best.pt"))
+    parser.add_argument("--weights", type=Path, default=Path("models/best_v2.pt"))
     parser.add_argument("--output", type=Path, default=Path("videos/output"))
     parser.add_argument("--conf", type=float, default=None,
                         help="confidence threshold (default 0.25, or 0.10 with --track)")
@@ -77,10 +79,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# Directories whose .py files change what a result looks like. The dashboard
-# only reads finished files, so nothing else notices that a fix has landed and
-# every clip in videos/output stays as it was until this is run.
-PIPELINE_DIRS = ("detection", "tracking", "casa", "utils")
+# Files whose changes actually affect the detection/tracking/CASA outputs.
+# UI/frontend changes, docs, or other viewer-only code should not invalidate
+# the rebuild stamp and force every clip to be reprocessed.
+REBUILD_FILES = (
+    Path("detection/detector.py"),
+    Path("detection/inference.py"),
+    Path("tracking/tracker.py"),
+    Path("tracking/trajectory.py"),
+    Path("casa/metrics.py"),
+    Path("casa/motility.py"),
+    Path("utils/config.py"),
+)
 
 # What counts as a clip anywhere in the pipeline. WMV and MKV are here because
 # converting footage before upload is what broke a real recording: the desktop
@@ -90,35 +100,57 @@ VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".wmv", ".mkv"}
 
 
 def pipeline_fingerprint() -> str:
-    """Hash of the code that decides what a result looks like.
+    """Hash of the code and model weights that decide what a result looks like.
 
     Content, not mtime: a deploy checks the repo out fresh, so every file's
     mtime is "now" on the server and a timestamp comparison would re-analyse
-    every clip on every push, including README-only ones.
+    every clip on every push, including README-only ones. Model changes must
+    also invalidate the rebuild stamp so old videos are reprocessed with the
+    new checkpoint.
     """
     digest = hashlib.sha256()
-    for directory in PIPELINE_DIRS:
-        for path in sorted(Path(directory).glob("*.py")):
+    for path in REBUILD_FILES:
+        if path.exists():
             digest.update(path.read_bytes())
+    for path in sorted(Path("models").glob("*.pt")):
+        digest.update(path.name.encode())
+        digest.update(path.read_bytes())
     return digest.hexdigest()[:12]
 
 
 def stale_videos(input_dir: Path, output_dir: Path) -> list[Path]:
-    """Inputs never analysed, or analysed by a different version of the code.
+    """Inputs whose stored results predate the current pipeline code.
 
-    Covers the preloaded samples and dashboard uploads alike — they are the
-    same files to this, and the suffixes are the ones the uploader accepts.
+    Gated on the fingerprint, not "every video, always". Rebuilding
+    unconditionally re-runs detection and tracking on a UI-only push, which
+    rewrites every ``*_trajectories.json`` — and since the dashboard's cached
+    highlight clips and browser transcodes are invalidated by that file's
+    mtime, it silently throws away every prerendered clip and makes finished
+    analyses slow to open again until they are all re-rendered.
     """
     current = pipeline_fingerprint()
     stale = []
-    sources = (p for p in sorted(input_dir.iterdir())
-               if p.suffix.lower() in VIDEO_SUFFIXES)
-    for source in sources:
+    for source in sorted(input_dir.iterdir()):
+        if source.suffix.lower() not in VIDEO_SUFFIXES:
+            continue
         stamp = output_dir / f"{source.stem}.build"
-        csv = output_dir / f"{source.stem}_metrics.csv"
-        if not csv.exists() or not stamp.exists() or stamp.read_text().strip() != current:
+        if not stamp.exists() or stamp.read_text().strip() != current:
             stale.append(source)
     return stale
+
+
+def prerender_all(input_dir: Path, output_dir: Path) -> None:
+    """Make sure every analysed clip has its highlight clips already rendered.
+
+    Separate from the re-analysis loop because the two are gated differently:
+    a video can be up to date with the current pipeline (so it is never
+    re-analysed) and still have no cached clips, which is exactly the case
+    that makes opening a finished analysis slow. ``prerender`` skips whatever
+    is already fresh, so this costs a few file stats when everything is warm.
+    """
+    for source in sorted(input_dir.iterdir()):
+        if source.suffix.lower() in VIDEO_SUFFIXES:
+            prerender(source.stem, source, output_dir)
 
 
 def main() -> None:
@@ -161,20 +193,49 @@ def main() -> None:
         sources = stale_videos(args.input_dir, args.output)
         if not sources:
             logger.info("every video in %s is already up to date", args.input_dir)
+            prerender_all(args.input_dir, args.output)
             return
         logger.info("re-analysing %d video(s): %s",
                     len(sources), ", ".join(s.stem for s in sources))
     else:
         sources = [args.source]
 
+    # --rebuild runs on the always-on frontend by design — it is dispatched
+    # from the deploy pipeline, which has no GPU. Checked once, not per clip:
+    # the GPU box does not come and go within the few minutes a batch takes,
+    # and one probe instead of N is one fewer way to be unlucky on a flaky
+    # connection.
+    use_remote = args.rebuild and remote_analysis.available()
+    if args.rebuild:
+        logger.info("GPU box %s for this batch", "available — dispatching there" if use_remote
+                    else "not reachable — running on this machine")
+
     for source in sources:
-        destination = run(detector, str(source), config, show=args.show,
-                          max_frames=args.max_frames, track=args.track or args.rebuild,
-                          tracker_config=tracker_config, metrics=args.metrics or args.rebuild,
-                          microns_per_pixel=args.um_per_px, motility_thresholds=thresholds)
+        remote_ok = False
+        if use_remote:
+            remote_ok = remote_analysis.run_remote(
+                Path(source), tracker_config.min_track_length, output_dir=args.output)
+            if not remote_ok:
+                logger.warning("%s: GPU run failed, falling back to local", Path(source).stem)
+
+        if remote_ok:
+            destination = args.output / f"{Path(source).stem}_tracked.mp4"
+        else:
+            destination = run(detector, str(source), config, show=args.show,
+                              max_frames=args.max_frames, track=args.track or args.rebuild,
+                              tracker_config=tracker_config, metrics=args.metrics or args.rebuild,
+                              microns_per_pixel=args.um_per_px, motility_thresholds=thresholds)
         if args.rebuild:
+            # Render every per-cell/top-N highlight clip and browser-playable
+            # transcode now, while this batch job already has the machine to
+            # itself — otherwise the dashboard renders them lazily on first
+            # view, which is what makes reopening a "finished" analysis slow.
+            prerender(Path(source).stem, Path(source), args.output)
             # Written last, so an interrupted rebuild leaves the clip stale and
-            # the next deploy picks it up again.
+            # the next deploy picks it up again. The fingerprint describes
+            # *this* machine's code — correct either way, since a remote run
+            # only happens once the GPU box has been confirmed to match (see
+            # the deploy pipeline's "Sync code to the GPU box" step).
             (args.output / f"{Path(source).stem}.build").write_text(pipeline_fingerprint())
         logger.info("output written to %s", destination)
 
