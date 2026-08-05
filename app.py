@@ -476,7 +476,7 @@ PLAYER_HTML = """
     <input type="checkbox" id="top"><span class="track"></span><span>Top sperms</span>
   </label>
 </div>
-<video id="v" autoplay muted loop playsinline></video>
+<video id="v" controls autoplay muted loop playsinline></video>
 
 <script>
   const SRC = __SRC__;
