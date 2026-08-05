@@ -23,6 +23,7 @@ from tracking.trajectory import Trajectory, TrajectoryBuilder
 from utils.config import Config, MICRONS_PER_PIXEL
 from utils.draw import draw_count, draw_detections, draw_tracks
 from utils.helpers import is_image, output_path, resolve_source
+from utils.video import plausible_fps
 
 logger = logging.getLogger(__name__)
 
@@ -86,14 +87,9 @@ def run_video(
     # wrong frame rate scales every result with it. Cameras and converters do
     # write nonsense here — an uploaded clip declared 1000 fps, which would
     # have reported VCL twenty times too high had any cell been detected.
-    # Anything outside what a microscope camera plausibly produces is refused
-    # in favour of the known rig rate.
-    fps = cap.get(cv2.CAP_PROP_FPS) or FALLBACK_FPS
-    if not 5.0 <= fps <= 240.0:
-        logger.warning("video claims %.1f fps, which is not a plausible capture rate — "
-                       "using %.1f instead; velocities would otherwise be wrong by %.0fx",
-                       fps, FALLBACK_FPS, fps / FALLBACK_FPS)
-        fps = FALLBACK_FPS
+    # Shared with the highlight renderers so every clip written for one video
+    # agrees on its rate.
+    fps = plausible_fps(cap.get(cv2.CAP_PROP_FPS))
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -148,8 +144,16 @@ def run_video(
                 ok, frame = replay.read()
                 if not ok:
                     break
-                corrected = [replace(t, track_id=id_map.get(t.track_id, t.track_id))
-                            for t in raw_tracks]
+                # Only cells that survived into `trajectories` are drawn. A
+                # track shorter than min_track_length is dropped from the
+                # metrics and from the dashboard's sperm list, but it used to
+                # keep its label on screen — so the overlay showed IDs (6, 9,
+                # 11 ...) that could not be selected anywhere, and the numbers
+                # a viewer read off the video did not line up with the ones in
+                # the single-sperm view.
+                corrected = [t for t in (replace(t, track_id=id_map.get(t.track_id, t.track_id))
+                                         for t in raw_tracks)
+                             if t.track_id in trajectories]
                 annotated = draw_count(
                     draw_tracks(frame, corrected, trajectories, config.draw),
                     len(corrected), config.draw,

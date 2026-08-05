@@ -20,6 +20,7 @@ from tracking.tracker import TrackerConfig
 from utils import remote_analysis
 from utils.config import MICRONS_PER_PIXEL, Config
 from utils.helpers import setup_logging
+from utils.highlight import prerender
 
 logger = logging.getLogger("casa")
 
@@ -118,20 +119,38 @@ def pipeline_fingerprint() -> str:
 
 
 def stale_videos(input_dir: Path, output_dir: Path) -> list[Path]:
-    """Inputs that should be reprocessed for the current deployment.
+    """Inputs whose stored results predate the current pipeline code.
 
-    The deployed frontend still has older cached clips from the previous
-    behaviour, so a rebuild should reprocess every existing input video once
-    after the new deployment lands. This is intentionally broader than a
-    normal incremental rebuild because the old outputs are visibly different
-    from the new full-length ones.
+    Gated on the fingerprint, not "every video, always". Rebuilding
+    unconditionally re-runs detection and tracking on a UI-only push, which
+    rewrites every ``*_trajectories.json`` — and since the dashboard's cached
+    highlight clips and browser transcodes are invalidated by that file's
+    mtime, it silently throws away every prerendered clip and makes finished
+    analyses slow to open again until they are all re-rendered.
     """
+    current = pipeline_fingerprint()
     stale = []
-    sources = (p for p in sorted(input_dir.iterdir())
-               if p.suffix.lower() in VIDEO_SUFFIXES)
-    for source in sources:
-        stale.append(source)
+    for source in sorted(input_dir.iterdir()):
+        if source.suffix.lower() not in VIDEO_SUFFIXES:
+            continue
+        stamp = output_dir / f"{source.stem}.build"
+        if not stamp.exists() or stamp.read_text().strip() != current:
+            stale.append(source)
     return stale
+
+
+def prerender_all(input_dir: Path, output_dir: Path) -> None:
+    """Make sure every analysed clip has its highlight clips already rendered.
+
+    Separate from the re-analysis loop because the two are gated differently:
+    a video can be up to date with the current pipeline (so it is never
+    re-analysed) and still have no cached clips, which is exactly the case
+    that makes opening a finished analysis slow. ``prerender`` skips whatever
+    is already fresh, so this costs a few file stats when everything is warm.
+    """
+    for source in sorted(input_dir.iterdir()):
+        if source.suffix.lower() in VIDEO_SUFFIXES:
+            prerender(source.stem, source, output_dir)
 
 
 def main() -> None:
@@ -174,6 +193,7 @@ def main() -> None:
         sources = stale_videos(args.input_dir, args.output)
         if not sources:
             logger.info("every video in %s is already up to date", args.input_dir)
+            prerender_all(args.input_dir, args.output)
             return
         logger.info("re-analysing %d video(s): %s",
                     len(sources), ", ".join(s.stem for s in sources))
@@ -206,6 +226,11 @@ def main() -> None:
                               tracker_config=tracker_config, metrics=args.metrics or args.rebuild,
                               microns_per_pixel=args.um_per_px, motility_thresholds=thresholds)
         if args.rebuild:
+            # Render every per-cell/top-N highlight clip and browser-playable
+            # transcode now, while this batch job already has the machine to
+            # itself — otherwise the dashboard renders them lazily on first
+            # view, which is what makes reopening a "finished" analysis slow.
+            prerender(Path(source).stem, Path(source), args.output)
             # Written last, so an interrupted rebuild leaves the clip stale and
             # the next deploy picks it up again. The fingerprint describes
             # *this* machine's code — correct either way, since a remote run

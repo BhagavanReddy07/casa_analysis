@@ -3,6 +3,11 @@
 # them, so they must stay out of history.
 videos/
 
+# Browser-playable copies the dashboard serves at /app/static/. Regenerated
+# from videos/ by prerender on every deploy, so committing them would only
+# put another ~140 MB of derived video into history.
+static/
+
 # Phase 1 training run: curves, confusion matrices, last.pt. 18 MB of
 # artifacts nothing in the pipeline reads. models/best.pt IS committed —
 # it is 5.4 MB and the app cannot run without it.
