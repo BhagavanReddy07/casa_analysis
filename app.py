@@ -28,9 +28,7 @@ from utils.config import MICRONS_PER_PIXEL, Config, DrawConfig
 from utils.explain import (GRADE_HELP, GRADE_LABEL, METRIC_HELP, WHO_DISCLAIMER,
                            WHO_REFERENCE)
 from utils.helpers import setup_logging
-from utils.highlight import (MAX_TOP_MARKS, STATIC_DIR, load_trajectories, prerender,
-                             render_highlight, render_top_n, top_clip_path,
-                             top_performer_ranking)
+from utils.highlight import load_trajectories, render_highlight, render_top_n
 from utils import remote_analysis
 from utils.video import ensure_browser_playable
 
@@ -744,16 +742,13 @@ def render_upload(tracker_config: TrackerConfig) -> None:
     used_remote = False
     if remote_analysis.available():
         with st.spinner("Analysing on the GPU box… the page stays frozen until this finishes."):
-            used_remote = remote_analysis.run_remote(destination, tracker_config.min_track_length,
-                                                     output_dir=OUTPUT_DIR)
+            used_remote = remote_analysis.run_remote(destination, tracker_config.min_track_length)
         if not used_remote:
             st.warning("The GPU box didn't finish the run — analysing locally instead. "
                       "This is slower; try again later if you want the GPU box to pick it up.")
 
     if not used_remote:
-        config = Config(weights=Path("models/best_v2.pt"),
-                        conf=tracker_config.track_low_thresh,
-                        output_dir=OUTPUT_DIR)
+        config = Config(conf=tracker_config.track_low_thresh, output_dir=OUTPUT_DIR)
         config.draw.show_conf = False
         config.draw.trail_length = 0
 
@@ -818,18 +813,16 @@ def main() -> None:
             st.caption("Sample")
             with st.popover(stem, width='stretch'):
                 for v in all_stems:
-                    with st.container(key=f"row_{v}"):
-                        row_select, row_delete = st.columns([5, 1])
-                        with row_select:
-                            if st.button(v, key=f"select_{v}", width='stretch',
-                                         type="primary" if v == stem else "secondary"):
-                                st.session_state["selected_stem"] = v
-                                st.rerun()
-                        with row_delete:
-                            if st.button(":material/delete:", key=f"delete_{v}",
-                                         help=f"Delete {v}"):
-                                st.session_state["confirm_delete"] = v
-                                st.rerun()
+                    row_select, row_delete = st.columns([5, 1])
+                    with row_select:
+                        if st.button(v, key=f"select_{v}", width='stretch',
+                                     type="primary" if v == stem else "secondary"):
+                            st.session_state["selected_stem"] = v
+                            st.rerun()
+                    with row_delete:
+                        if st.button("✕", key=f"delete_{v}", help=f"Delete {v}"):
+                            st.session_state["confirm_delete"] = v
+                            st.rerun()
 
                 confirm_target = st.session_state.get("confirm_delete")
                 if confirm_target in all_stems:
