@@ -171,13 +171,13 @@ def prerender(stem: str, source: Path, output_dir: Path, top_n: int = MAX_TOP_MA
     highlight_dir = output_dir / "highlights"
     highlight_dir.mkdir(parents=True, exist_ok=True)
 
-    for track_id, trajectory in trajectories.items():
-        clip = highlight_dir / f"{stem}_id{track_id}.mp4"
-        if _stale(clip, trajectories_path) or _wrong_fps(clip):
-            render_highlight(source, trajectory, track_id, clip)
-        if clip.exists():
-            ensure_browser_playable(clip, out_dir=STATIC_DIR)
-
+    # The top-N clip first, and only the ranked cells after it. Rendering a
+    # clip per trajectory is fine at 40 cells and pathological when tracking
+    # fragments: one deployed sample produced 1663 tracks, which at ~14s each
+    # is over six hours -- and because the top-N clip used to be rendered
+    # last, the "Top sperms" switch stayed dead for that whole time. The
+    # unranked cells still render on first click, which is what the lazy path
+    # in the dashboard has always done.
     ranking = top_performer_ranking(pd.read_csv(csv_path))
     if ranking:
         clip = top_clip_path(stem, highlight_dir, ranking, top_n)
@@ -196,6 +196,16 @@ def prerender(stem: str, source: Path, output_dir: Path, top_n: int = MAX_TOP_MA
             for old in STATIC_DIR.glob(f"{stem}_top{top_n}_*.h264.mp4"):
                 if not old.name.startswith(keep + "."):
                     old.unlink(missing_ok=True)
+
+    for track_id in ranking[:top_n]:
+        trajectory = trajectories.get(track_id)
+        if trajectory is None:
+            continue
+        clip = highlight_dir / f"{stem}_id{track_id}.mp4"
+        if _stale(clip, trajectories_path) or _wrong_fps(clip):
+            render_highlight(source, trajectory, track_id, clip)
+        if clip.exists():
+            ensure_browser_playable(clip, out_dir=STATIC_DIR)
 
 
 def render_highlight(
