@@ -93,6 +93,29 @@ STYLE = """
     border-radius: 8px;
   }
 
+  /* Both dropdowns — the Sample popover and the single-sperm selectbox —
+     render in a portal at the document root, so nothing about the column
+     they belong to constrains them: they size to their content and are
+     positioned to fit the viewport. At browser zoom that content grows while
+     the viewport does not, so the menu spills sideways out of the sidebar
+     and downward across the video, which is what makes it look like the
+     dropdown has jumped onto the frame.
+
+     Capping both dimensions is the whole fix. Width is tied to the trigger
+     so a menu can never be wider than the control that opened it, and height
+     is a viewport fraction so a long cell list scrolls inside its own box
+     instead of growing until it covers the player. */
+  div[data-testid="stPopoverBody"] {
+    max-width: min(22rem, 92vw) !important;
+    max-height: 45vh !important;
+    overflow-y: auto !important;
+  }
+  div[data-baseweb="popover"] ul[role="listbox"],
+  div[data-baseweb="popover"] div[data-baseweb="menu"] {
+    max-height: 40vh !important;
+    overflow-y: auto !important;
+  }
+
   /* The "Sample" popover trigger, styled to match the plain black
      st.selectbox it replaced (dark surface, red focus border) instead of
      reading as a generic grey button. The popover body renders in a portal
@@ -250,7 +273,18 @@ def processed_videos() -> dict[str, dict[str, Path]]:
 
 def delete_video(stem: str, paths: dict[str, Path]) -> None:
     """Remove a video's source, tracked output, metrics, and highlight clips."""
-    for path in (paths["source"], paths["tracked"], paths["csv"], paths["trajectories"]):
+    for path in (paths["source"], paths["tracked"], paths["csv"], paths["trajectories"],
+                 # The rebuild stamp. Without this a deleted clip leaves behind
+                 # a fingerprint claiming its results are current, so
+                 # re-uploading the same name is skipped by `main.py --rebuild`
+                 # as already up to date when nothing of it is left.
+                 OUTPUT_DIR / f"{stem}.build",
+                 # Browser transcodes go to STATIC_DIR (cleaned below), but
+                 # clips analysed before that change left a copy beside the
+                 # tracked video. ~40 MB each, and nothing else ever removes
+                 # them.
+                 OUTPUT_DIR / f"{stem}_tracked.h264.mp4",
+                 OUTPUT_DIR / f"{stem}.h264.mp4"):
         path.unlink(missing_ok=True)
     for pattern in (f"{stem}_id*.mp4", f"{stem}_top*.mp4"):
         for clip in HIGHLIGHT_DIR.glob(pattern):

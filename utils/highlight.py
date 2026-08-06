@@ -21,7 +21,7 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from casa.motility import MotilityThresholds
+from casa.motility import MotilityGrade, MotilityThresholds, top_rank_key
 from utils.config import DrawConfig
 from utils.draw import FONT, draw_count, track_color
 from utils.video import (MAX_PLAUSIBLE_FPS, MIN_PLAUSIBLE_FPS, ensure_browser_playable,
@@ -37,13 +37,6 @@ logger = logging.getLogger(__name__)
 # again and there is no advantage over the full overlay.
 MAX_TOP_MARKS = 6
 
-# A non-progressive cell only qualifies if it is genuinely swimming, not just
-# clearing the immotile floor. 2.5x that floor (25 um/s VCL against the 10 um/s
-# cut-off in casa/motility.py) drops the bottom ~30% of non-progressive cells
-# in the reference samples — the ones twitching in place.
-DECENT_VCL_MULTIPLE = 2.5
-
-
 def load_trajectories(path: Path) -> dict[int, dict]:
     """Load a ``*_trajectories.json`` file, keyed by int track_id."""
     raw = json.loads(Path(path).read_text())
@@ -56,8 +49,18 @@ def top_performer_ranking(df: pd.DataFrame) -> list[int]:
     Eligibility, not just ordering: immotile cells and tracks with rejected
     measurements are excluded outright, and a non-progressive cell is only
     admitted if its VCL clears ``DECENT_VCL_MULTIPLE`` times the immotile
-    floor. An empty list is a real answer — it means nothing in the sample is
-    swimming well enough to call a top performer, and nothing gets marked.
+    floor *and* its VSL clears the floor itself. An empty list is a real
+    answer — it means nothing in the sample is swimming well enough to call a
+    top performer, and nothing gets marked.
+
+    The VSL condition is what keeps a thrashing cell out. VCL measures path
+    length, so a head vibrating on the spot scores as highly as one crossing
+    the frame: on clip 60, ID 1 had VCL 83 um/s with VSL 0.4 um/s and ID 94
+    had VCL 58 with VSL 2.9. Both were marked as top performers while cells
+    that were visibly swimming went unmarked, because with only two
+    progressive cells in that sample the remaining slots went to whoever
+    twitched hardest. Requiring net displacement as well as vigour drops
+    exactly those two and changes nothing on the other reference clips.
 
     Progressive cells always outrank non-progressive ones. Within progressive
     the tiebreak is VSL, which measures net forward progress; within
@@ -68,18 +71,18 @@ def top_performer_ranking(df: pd.DataFrame) -> list[int]:
         return []
 
     ok = df[df["plausible"].astype(bool)] if "plausible" in df else df
-    decent_vcl = MotilityThresholds().immotile_vcl * DECENT_VCL_MULTIPLE
-    is_progressive = ok["motility"] == "progressive"
-    is_decent_non_prog = (ok["motility"] == "non_progressive") & (ok["vcl_um_s"] >= decent_vcl)
-    ok = ok[is_progressive | is_decent_non_prog]
-    if ok.empty:
-        return []
-
-    ok = ok.assign(
-        _grade=(ok["motility"] != "progressive").astype(int),
-        _score=ok["vsl_um_s"].where(ok["motility"] == "progressive", ok["vcl_um_s"]),
-    ).sort_values(["_grade", "_score"], ascending=[True, False])
-    return [int(t) for t in ok["track_id"]]
+    thresholds = MotilityThresholds()
+    ranked = []
+    for row in ok.itertuples(index=False):
+        try:
+            grade = MotilityGrade(row.motility)
+        except ValueError:      # "unreliable" and anything else is not a cell to mark
+            continue
+        key = top_rank_key(grade, float(row.vcl_um_s), float(row.vsl_um_s), thresholds)
+        if key is not None:
+            ranked.append((key, int(row.track_id)))
+    ranked.sort()
+    return [track_id for _, track_id in ranked]
 
 
 # Bumped whenever what gets *drawn* on the top-N clip changes. The filename
@@ -396,3 +399,30 @@ def render_top_n(
         writer.release()
 
     return destination
+
+
+if __name__ == "__main__":
+    # ponytail: one self-check, on who is allowed to be called a top
+    # performer. This is the part with a clinical meaning attached, and the
+    # part that was wrong — a cell can post a high VCL while going nowhere,
+    # and marking it while genuinely swimming cells go unmarked is exactly
+    # what the view exists to avoid.
+    _rows = [
+        # id, motility,          VCL,  VSL,  plausible
+        (1, "progressive",       60.0, 40.0, True),
+        (2, "immotile",           5.0,  1.0, True),   # below the floor
+        (3, "non_progressive",   83.0,  0.4, True),   # thrashes in place
+        (4, "non_progressive",   50.0, 20.0, True),   # vigorous and travelling
+        (5, "non_progressive",   15.0, 12.0, True),   # barely off the floor
+        (6, "progressive",      100.0, 90.0, False),  # measurement rejected
+    ]
+    _df = pd.DataFrame(_rows, columns=["track_id", "motility", "vcl_um_s",
+                                       "vsl_um_s", "plausible"])
+    _ranked = top_performer_ranking(_df)
+    assert _ranked == [1, 4], f"expected progressive 1 then travelling 4, got {_ranked}"
+    assert 3 not in _ranked, "a cell with VCL 83 and VSL 0.4 is not a top performer"
+    assert 6 not in _ranked, "an implausible measurement must never be marked"
+    assert top_performer_ranking(_df[_df["motility"] == "immotile"]) == [], \
+        "an all-immotile sample must mark nothing at all"
+
+    print("highlight.py self-check passed")

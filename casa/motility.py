@@ -39,6 +39,42 @@ class MotilityReport:
     total: int
 
 
+# A non-progressive cell only qualifies as a top performer if it is genuinely
+# swimming, not just clearing the immotile floor. 2.5x that floor (25 um/s VCL
+# against the 10 um/s cut-off) drops the bottom ~30% of non-progressive cells
+# in the reference samples — the ones twitching in place.
+DECENT_VCL_MULTIPLE = 2.5
+
+
+def top_rank_key(grade: MotilityGrade, vcl: float, vsl: float,
+                 thresholds: MotilityThresholds) -> tuple[int, float] | None:
+    """Sort key for top-performer ranking, or ``None`` if not eligible.
+
+    Scalar and stateless on purpose: the dashboard ranks a whole DataFrame at
+    the end of a run and the live path ranks one cell at a time, and those two
+    must never be able to disagree about who is a top performer. One rule,
+    two callers.
+
+    Progressive always outranks non-progressive. Within progressive the
+    tiebreak is VSL (net forward progress); within non-progressive it is VCL,
+    since by definition they are not progressing and what distinguishes them
+    is raw vigour.
+
+    The VSL condition is what keeps a thrashing cell out. VCL measures path
+    length, so a head vibrating on the spot scores as highly as one crossing
+    the frame: on clip 60, ID 1 had VCL 83 um/s with VSL 0.4 um/s and ID 94
+    had VCL 58 with VSL 2.9, and both were being marked as top performers
+    while cells that were visibly swimming went unmarked.
+    """
+    if grade == MotilityGrade.PROGRESSIVE:
+        return (0, -vsl)
+    if (grade == MotilityGrade.NON_PROGRESSIVE
+            and vcl >= thresholds.immotile_vcl * DECENT_VCL_MULTIPLE
+            and vsl >= thresholds.immotile_vcl):
+        return (1, -vcl)
+    return None
+
+
 def classify(metrics: KinematicMetrics, thresholds: MotilityThresholds) -> MotilityGrade:
     """Grade a single sperm.
 

@@ -247,6 +247,39 @@ classes={0: 'sperm'} device=cpu (torch 2.7.0+cpu is the CPU-only build)
 The Elastic IP survives the stop/start, so `EC2_HOST` stays valid and the next
 push deploys as usual. Deploys do not disturb the CUDA build: `torch` is not
 pinned in `requirements.txt`, and pip leaves a satisfying version alone.
+
+### The GPU box stops itself when idle
+
+On-Demand bills every second an instance is `running`, busy or not — "on
+demand" is the rate, not a per-use meter. A `g4dn.xlarge` left on overnight
+costs a full day whether it analysed anything or not, and on 2026-08-05 it did
+exactly that: 23.5 hours up for 75 seconds of GPU work.
+
+[scripts/gpu-idle-stop.sh](scripts/gpu-idle-stop.sh) runs every five minutes
+from `gpu-idle-stop.timer` and stops the box after 30 consecutive idle
+minutes. Idle means no established connection to `sshd`, no `main.py`, and no
+process holding the GPU — the SSH check is the one that matters, because
+`utils/remote_analysis.py` keeps a connection open through the upload, the run
+*and* the result transfer, while GPU utilisation drops to zero mid-run
+whenever `inference.py` re-encodes the annotated video on CPU. The deploy
+installs and enables it on every push, so it cannot drift.
+
+`sh scripts/gpu-idle-stop-test.sh` checks the counting logic anywhere, with no
+GPU and no EC2.
+
+**This assumes the instance's shutdown behaviour is `stop`** (the EC2
+default): the script has no AWS credentials and simply calls `shutdown -h now`
+on itself. If that attribute is ever set to `terminate`, the same timer
+destroys the box. Verify under *Actions → Instance settings → Change shutdown
+behavior* before relying on it.
+
+It does **not** start the box again. Nothing inside a stopped instance can,
+and neither can the dashboard as it stands — `remote_analysis.available()` is
+a TCP probe, so a stopped box just reads as "off" and the upload falls back to
+the frontend's own CPU. Waking it on demand would need an IAM instance profile
+on the frontend granting `ec2:StartInstances` on the GPU instance, plus a
+boot-and-wait loop before the dispatch. Neither instance has any IAM role
+today.
 4. Run as a service so it survives reboots:
    ```ini
    # /etc/systemd/system/casa.service

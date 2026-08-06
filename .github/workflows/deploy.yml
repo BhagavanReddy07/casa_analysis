@@ -123,6 +123,29 @@ jobs:
               ssh -i ~/.ssh/sperm_analysis_key.pem -o StrictHostKeyChecking=accept-new \
                 ubuntu@${{ secrets.ANALYSIS_HOST }} \
                 "cd ~/sperm_CASA && .venv/bin/pip install -q -r requirements.txt"
+
+              # The idle-stop timer lives outside ~/sperm_CASA (/usr/local/bin
+              # and /etc/systemd), so installing it here is what keeps it from
+              # drifting the way the analysis code itself did. Idempotent:
+              # re-installing the same files and re-enabling an enabled timer
+              # are both no-ops, so every deploy just reasserts the state.
+              #
+              # This box bills On-Demand for every second it is `running`,
+              # idle or not — see scripts/gpu-idle-stop.sh. `enable --now`
+              # assumes this instance's InstanceInitiatedShutdownBehavior is
+              # `stop` (the EC2 default). If it were ever changed to
+              # `terminate`, this timer would destroy the box after 30 idle
+              # minutes instead of pausing it.
+              ssh -i ~/.ssh/sperm_analysis_key.pem -o StrictHostKeyChecking=accept-new \
+                ubuntu@${{ secrets.ANALYSIS_HOST }} '
+                  set -e
+                  cd ~/sperm_CASA
+                  sudo install -m 755 scripts/gpu-idle-stop.sh /usr/local/bin/gpu-idle-stop.sh
+                  sudo install -m 644 scripts/gpu-idle-stop.service \
+                    scripts/gpu-idle-stop.timer /etc/systemd/system/
+                  sudo systemctl daemon-reload
+                  sudo systemctl enable --now gpu-idle-stop.timer
+                '
               echo "GPU box code synced"
           '
 

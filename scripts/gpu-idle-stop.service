@@ -1,0 +1,6 @@
+[Unit]
+Description=Stop the GPU box when it has been idle
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gpu-idle-stop.sh

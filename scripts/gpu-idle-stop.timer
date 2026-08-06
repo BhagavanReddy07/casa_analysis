@@ -1,0 +1,12 @@
+[Unit]
+Description=Stop the GPU box when it has been idle (see gpu-idle-stop.sh)
+
+[Timer]
+# First sample 10 minutes after boot, so a hand-started box always gets a
+# grace period before the counter can begin, then every 5 minutes.
+OnBootSec=10min
+OnUnitActiveSec=5min
+Unit=gpu-idle-stop.service
+
+[Install]
+WantedBy=timers.target
