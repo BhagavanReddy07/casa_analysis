@@ -145,7 +145,7 @@ def repair_fragments(
     max_distance: int = 20,
     lag: int = 8,
     window: int = 10,
-) -> int:
+) -> dict[int, int]:
     """Join a track that is plainly the continuation of a dead one.
 
     ByteTrack already re-acquires a lost identity for ``track_buffer * fps/30``
@@ -175,9 +175,12 @@ def repair_fragments(
     cells together on clip 60, which the switch count barely notices and IDF1
     punishes. 20 px is the widest gate where no clip regresses.
 
-    Returns how many joins were made.
+    Returns the rename map, ``{merged_id: surviving_id}`` — one entry per join,
+    so ``len()`` is the join count. A merged id is deleted before any later
+    track is considered, so it can never itself be a merge target: the map is
+    always one level deep, never a chain to follow.
     """
-    joins = 0
+    renamed: dict[int, int] = {}
     # Oldest first, so A->B->C collapses in one pass: B is merged into A before
     # C is considered, and C then matches the extended A.
     for track_id in sorted(trajectories, key=lambda t: trajectories[t].frames[0]):
@@ -209,10 +212,10 @@ def repair_fragments(
         target.neck_points += candidate.neck_points
         target.observed = list(target.observed_mask) + list(candidate.observed_mask)
         del trajectories[track_id]
-        joins += 1
+        renamed[track_id] = best
         logger.info("track %d continues track %d (%.1f px from prediction, %d frame gap)",
                     track_id, best, best_gap, gap)
-    return joins
+    return renamed
 
 
 class TrajectoryBuilder:
@@ -253,21 +256,6 @@ class TrajectoryBuilder:
             filled = sum(t.fill_gaps() for t in kept.values())
             logger.info("repaired %d fragment(s), filled %d frame(s) across %d gap(s)",
                         len(renamed), filled, sum(1 for t in kept.values() if t.filled))
-
-    def finalize(self, min_length: int = 10, repair: bool = True) -> dict[int, Trajectory]:
-        """Return trajectories long enough to measure, gaps repaired.
-
-        Order matters. Fragments are joined *before* the length filter, so a
-        cell broken into two short pieces is measured as one long track instead
-        of being discarded twice; and gaps are filled last, so a join's own gap
-        is filled too.
-        """
-        kept = dict(self._trajectories)
-        if repair:
-            joins = repair_fragments(kept)
-            filled = sum(t.fill_gaps() for t in kept.values())
-            logger.info("repaired %d fragment(s), filled %d frame(s) across %d gap(s)",
-                        joins, filled, sum(1 for t in kept.values() if t.filled))
 
         kept = {k: v for k, v in kept.items() if len(v) >= min_length}
         logger.info("kept %d/%d trajectories at min_length=%d",
@@ -349,13 +337,20 @@ if __name__ == "__main__":
                           observed=[True] * len(frames))
 
     broken = {2: _track(2, [0, 1, 2, 3, 4]), 3: _track(3, [7, 8, 9, 10])}
-    assert repair_fragments(broken) == 1, "a clean continuation was not joined"
+    assert repair_fragments(broken) == {3: 2}, "a clean continuation was not joined"
     assert list(broken) == [2], f"join kept the wrong id: {list(broken)}"
     assert broken[2].frames == [0, 1, 2, 3, 4, 7, 8, 9, 10]
 
     overlapping = {4: _track(4, [0, 1, 2, 3, 4]), 5: _track(5, [3, 4, 5, 6])}
-    assert repair_fragments(overlapping) == 0, "joined two cells that co-existed"
+    assert repair_fragments(overlapping) == {}, "joined two cells that co-existed"
     assert len(overlapping) == 2
+
+    # finalize must hand back both halves — the trajectories and the rename map
+    # the overlay needs to relabel a join. Returning a bare dict here is what
+    # broke every run on 2026-08-05.
+    builder = TrajectoryBuilder()
+    kept, id_map = builder.finalize(10)
+    assert kept == {} and id_map == {}, f"finalize must return (dict, dict), got {kept!r} {id_map!r}"
 
     # A gap longer than the limit stays open: a straight line across a long
     # absence is a guess, not a measurement.
