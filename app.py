@@ -39,6 +39,11 @@ OUTPUT_DIR = Path("videos/output")
 HIGHLIGHT_DIR = OUTPUT_DIR / "highlights"
 MAX_UPLOAD_MB = 50
 
+# Height of the sample list in the sidebar. About five rows at the 2.6rem row
+# height set in the stylesheet; past that it scrolls inside its own box rather
+# than pushing the upload controls off the bottom of the sidebar.
+SAMPLE_LIST_HEIGHT = 230
+
 setup_logging(logging.INFO)
 st.set_page_config(page_title="Sperm CASA", page_icon="🔬", layout="wide")
 
@@ -93,51 +98,25 @@ STYLE = """
     border-radius: 8px;
   }
 
-  /* Both dropdowns — the Sample popover and the single-sperm selectbox —
-     render in a portal at the document root, so nothing about the column
-     they belong to constrains them: they size to their content and are
-     positioned to fit the viewport. At browser zoom that content grows while
-     the viewport does not, so the menu spills sideways out of the sidebar
-     and downward across the video, which is what makes it look like the
-     dropdown has jumped onto the frame.
+  /* The one dropdown left is the single-sperm selectbox, and it now lives in
+     the sidebar, so its list is the sidebar's width and opens over the
+     sidebar rather than the player. The height cap is still worth keeping: a
+     sample with forty cells would otherwise produce a list taller than the
+     window.
 
-     Capping both dimensions is the whole fix. Width is tied to the trigger
-     so a menu can never be wider than the control that opened it, and height
-     is a viewport fraction so a long cell list scrolls inside its own box
-     instead of growing until it covers the player. */
-  div[data-testid="stPopoverBody"] {
-    max-width: min(22rem, 92vw) !important;
-    max-height: 45vh !important;
-    overflow-y: auto !important;
-  }
+     Neither this nor any other CSS is what fixed the menus appearing over the
+     video. Two separate attempts clamped the popover body's width and height
+     and neither worked, because a portal-rendered panel is positioned
+     relative to its trigger no matter what size it is. The fix was to stop
+     using a floating panel for the sample list at all. */
   div[data-baseweb="popover"] ul[role="listbox"],
   div[data-baseweb="popover"] div[data-baseweb="menu"] {
     max-height: 40vh !important;
     overflow-y: auto !important;
   }
 
-  /* The "Sample" popover trigger, styled to match the plain black
-     st.selectbox it replaced (dark surface, red focus border) instead of
-     reading as a generic grey button. The popover body renders in a portal
-     appended elsewhere in the DOM, not as a child of stPopover, so this
-     selector only ever reaches the closed trigger — it is safe from the
-     row/confirm buttons inside the open popover. */
-  div[data-testid="stPopover"] > div > button {
-    background: #0e1117 !important;
-    border: 1px solid rgba(250, 250, 250, 0.2) !important;
-    border-radius: 0.5rem !important;
-    color: #fafafa !important;
-    font-weight: 400 !important;
-    justify-content: space-between !important;
-  }
-  div[data-testid="stPopover"] > div > button:hover,
-  div[data-testid="stPopover"] > div > button:focus {
-    border-color: #ff4b4b !important;
-    color: #ff4b4b !important;
-  }
-
-  /* The sample list fills the whole dropdown as one unbroken box: the
-     popover body supplies the only border, and every row is a flush
+  /* The sample list reads as one unbroken box: the container supplies the
+     only border, and every row is a flush
      full-width strip with no divider, radius, margin or gap of its own —
      those are what left visible seams between rows before. `*` +
      !important is needed because Streamlit sets each button's own
@@ -189,21 +168,15 @@ STYLE = """
   }
   div[class*="st-key-delete_"] button p { margin: 0; line-height: 1; }
 
-  /* The popover body renders in a portal, positioned via inline styles the
-     component computes from the trigger's on-screen rect. Under non-100%
-     browser zoom that rect can read back scaled inconsistently, pushing the
-     panel past the right edge — clamping its width keeps it from running
-     off-screen even when its computed offset drifts. */
-  div[data-testid="stPopoverBody"] {
-    max-width: min(92vw, 340px) !important;
+  /* The sample list box. Zero padding so the rows meet its edges instead of
+     floating inside it, and the gap between stacked elements goes with it —
+     otherwise Streamlit's default vertical gap reappears between rows and the
+     unbroken-table look is lost. */
+  div[class*="st-key-sample_list"] {
     border-radius: 0.5rem !important;
-    /* Zero padding so the table meets the dropdown's own edges instead of
-       floating inside it, and the gap between stacked elements goes with it
-       — otherwise Streamlit's default vertical gap reappears between rows. */
     padding: 0 !important;
-    overflow: hidden;
   }
-  div[data-testid="stPopoverBody"] div[data-testid="stVerticalBlock"] { gap: 0 !important; }
+  div[class*="st-key-sample_list"] div[data-testid="stVerticalBlock"] { gap: 0 !important; }
   div[class*="st-key-confirm_area"] {
     border-top: 1px solid rgba(250, 250, 250, 0.25);
     padding: 12px;
@@ -437,10 +410,17 @@ def render_video_viewer(df: pd.DataFrame, paths: dict[str, Path], stem: str) -> 
         row = df[df["track_id"] == value].iloc[0]
         return f"ID {value} — {GRADE_LABEL.get(row.get('motility', ''), '?')}"
 
-    header_left, header_right = st.columns([3, 2], gap="large")
-    with header_right:
+    # In the sidebar, not above the video. A selectbox drops its list straight
+    # down from the trigger, so anywhere in the main column it opens over the
+    # player — which is what it was doing, and what browser zoom made worse.
+    # Here the list is the sidebar's width and opens over the sidebar.
+    with st.sidebar:
         options = [ALL_CELLS] + (df["track_id"].tolist() if not df.empty else [])
         selection = st.selectbox("Inspect a single sperm", options, format_func=label_for)
+
+    # Same 3:2 split as before so the view control keeps its width; the right
+    # column is empty now that the picker has moved.
+    header_left, _ = st.columns([3, 2], gap="large")
 
     inspecting = selection != ALL_CELLS
 
@@ -847,7 +827,15 @@ def main() -> None:
             stem = st.session_state["selected_stem"]
 
             st.caption("Sample")
-            with st.popover(stem, width='stretch'):
+            # An always-visible scrolling list, not a popover. st.popover puts
+            # its body in a portal at the document root, sized to its content
+            # instead of to the sidebar, so it opened sideways across the
+            # video — and worse the further the page is zoomed in, because
+            # there is less room beside it to open into. Capping the body's
+            # width and height did not fix that: the problem is where it is
+            # anchored, not how big it is. A plain container sits in the
+            # sidebar's own flow and so cannot overlap the player at all.
+            with st.container(height=SAMPLE_LIST_HEIGHT, border=True, key="sample_list"):
                 for v in all_stems:
                     with st.container(key=f"row_{v}"):
                         row_select, row_delete = st.columns([5, 1])
@@ -862,26 +850,27 @@ def main() -> None:
                                 st.session_state["confirm_delete"] = v
                                 st.rerun()
 
-                confirm_target = st.session_state.get("confirm_delete")
-                if confirm_target in all_stems:
-                    # Keyed so it can carry its own padding — the popover body
-                    # is zero-padded so the row table meets its edges.
-                    with st.container(key="confirm_area"):
-                        st.warning(f"Delete **{confirm_target}** and all its analysis data? "
-                                   "This can't be undone.")
-                        confirm_col, cancel_col = st.columns(2)
-                        with confirm_col:
-                            if st.button("Confirm delete", key="confirm_delete_btn",
-                                         type="primary"):
-                                delete_video(confirm_target, videos[confirm_target])
-                                del st.session_state["confirm_delete"]
-                                if st.session_state.get("selected_stem") == confirm_target:
-                                    del st.session_state["selected_stem"]
-                                st.rerun()
-                        with cancel_col:
-                            if st.button("Cancel", key="cancel_delete_btn"):
-                                del st.session_state["confirm_delete"]
-                                st.rerun()
+            confirm_target = st.session_state.get("confirm_delete")
+            if confirm_target in all_stems:
+                # Outside the scrolling list on purpose: asked to confirm a
+                # deletion, the warning must not be somewhere the reader has
+                # to scroll to find.
+                with st.container(key="confirm_area"):
+                    st.warning(f"Delete **{confirm_target}** and all its analysis data? "
+                               "This can't be undone.")
+                    confirm_col, cancel_col = st.columns(2)
+                    with confirm_col:
+                        if st.button("Confirm delete", key="confirm_delete_btn",
+                                     type="primary"):
+                            delete_video(confirm_target, videos[confirm_target])
+                            del st.session_state["confirm_delete"]
+                            if st.session_state.get("selected_stem") == confirm_target:
+                                del st.session_state["selected_stem"]
+                            st.rerun()
+                    with cancel_col:
+                        if st.button("Cancel", key="cancel_delete_btn"):
+                            del st.session_state["confirm_delete"]
+                            st.rerun()
         else:
             stem = None
             st.info("No analysed videos yet — upload one below.")
